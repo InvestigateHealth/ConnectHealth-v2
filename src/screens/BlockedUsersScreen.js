@@ -1,5 +1,5 @@
 // src/screens/BlockedUsersScreen.js
-// Improved screen for managing blocked users
+// Screen for managing blocked users
 
 import React, { useState, useEffect, useCallback } from 'react';
 import {
@@ -33,12 +33,21 @@ const BlockedUsersScreen = ({ navigation }) => {
   const [error, setError] = useState(null);
   
   // Animation value for item removal
-  const itemAnimatedValues = {};
-  blockedUserDetails.forEach(item => {
-    if (!itemAnimatedValues[item.id]) {
-      itemAnimatedValues[item.id] = new Animated.Value(1);
+  const [itemAnimatedValues, setItemAnimatedValues] = useState({});
+
+  // Initialize animation values for items
+  useEffect(() => {
+    const newAnimatedValues = {};
+    blockedUserDetails.forEach(item => {
+      if (!itemAnimatedValues[item.id]) {
+        newAnimatedValues[item.id] = new Animated.Value(1);
+      }
+    });
+    
+    if (Object.keys(newAnimatedValues).length > 0) {
+      setItemAnimatedValues(prev => ({...prev, ...newAnimatedValues}));
     }
-  });
+  }, [blockedUserDetails]);
 
   // Fetch blocked user details on component mount
   useEffect(() => {
@@ -86,15 +95,17 @@ const BlockedUsersScreen = ({ navigation }) => {
   }, []);
 
   // Function to animate item removal
-  const animateItemRemoval = (id, callback) => {
-    Animated.timing(itemAnimatedValues[id], {
-      toValue: 0,
-      duration: 300,
-      useNativeDriver: true
-    }).start(() => {
-      if (callback) callback();
-    });
-  };
+  const animateItemRemoval = useCallback((id, callback) => {
+    if (itemAnimatedValues[id]) {
+      Animated.timing(itemAnimatedValues[id], {
+        toValue: 0,
+        duration: 300,
+        useNativeDriver: true
+      }).start(() => {
+        if (callback) callback();
+      });
+    }
+  }, [itemAnimatedValues]);
 
   // Function to handle unblock
   const handleUnblock = useCallback((blockedUserId, userName) => {
@@ -139,7 +150,7 @@ const BlockedUsersScreen = ({ navigation }) => {
         }
       ]
     );
-  }, [isConnected, unblockUser]);
+  }, [isConnected, unblockUser, animateItemRemoval]);
 
   // Function to handle viewing a user's profile
   const handleViewProfile = useCallback((userId) => {
@@ -163,6 +174,19 @@ const BlockedUsersScreen = ({ navigation }) => {
     // Check if this item is being processed
     const isProcessing = processingIds.includes(item.id);
     const userName = `${item.firstName || ''} ${item.lastName || ''}`.trim() || 'Unknown User';
+    
+    // Ensure we have an animated value for this item
+    if (!itemAnimatedValues[item.id]) {
+      setTimeout(() => {
+        setItemAnimatedValues(prev => ({
+          ...prev,
+          [item.id]: new Animated.Value(1)
+        }));
+      }, 0);
+      
+      // Return null temporarily until animated value is created
+      return null;
+    }
     
     return (
       <Animated.View style={{
@@ -250,7 +274,7 @@ const BlockedUsersScreen = ({ navigation }) => {
         </View>
       </Animated.View>
     );
-  }, [theme, processingIds, handleUnblock, handleViewProfile, formatBlockDate]);
+  }, [theme, processingIds, handleUnblock, handleViewProfile, formatBlockDate, itemAnimatedValues]);
 
   // Render empty list message
   const renderEmptyList = useCallback(() => (
@@ -312,6 +336,26 @@ const BlockedUsersScreen = ({ navigation }) => {
       styles.container, 
       { backgroundColor: theme.colors.background.default }
     ]}>
+      {/* Offline mode banner */}
+      {!isConnected && (
+        <View style={[
+          styles.offlineWarning, 
+          { backgroundColor: theme.colors.warning.light }
+        ]}>
+          <Icon 
+            name="cloud-offline-outline" 
+            size={18} 
+            color={theme.colors.warning.dark} 
+          />
+          <Text style={[
+            styles.offlineWarningText, 
+            { color: theme.colors.warning.dark }
+          ]}>
+            You're offline. Some actions may be unavailable.
+          </Text>
+        </View>
+      )}
+
       {loading && !refreshing ? (
         <View style={styles.loadingContainer}>
           <ActivityIndicator size="large" color={theme.colors.primary.main} />
@@ -346,25 +390,6 @@ const BlockedUsersScreen = ({ navigation }) => {
               Blocked users cannot interact with you
             </Text>
           </View>
-          
-          {!isConnected && (
-            <View style={[
-              styles.offlineWarning, 
-              { backgroundColor: theme.colors.warning.light }
-            ]}>
-              <Icon 
-                name="cloud-offline-outline" 
-                size={18} 
-                color={theme.colors.warning.dark} 
-              />
-              <Text style={[
-                styles.offlineWarningText, 
-                { color: theme.colors.warning.dark }
-              ]}>
-                You're offline. Some actions may be unavailable.
-              </Text>
-            </View>
-          )}
           
           <FlatList
             data={blockedUserDetails}
