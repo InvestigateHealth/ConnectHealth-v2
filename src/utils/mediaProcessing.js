@@ -1,316 +1,275 @@
 // src/utils/mediaProcessing.js
-// Utility functions for processing images and videos
+// Utilities for processing images and videos before upload
 
 import { Platform } from 'react-native';
-import RNFS from 'react-native-fs';
 import ImageResizer from 'react-native-image-resizer';
-import ImagePicker from 'react-native-image-crop-picker';
+import { Image } from 'react-native-compressor';
+import { Video } from 'react-native-compressor';
+import RNFS from 'react-native-fs';
+import { FFmpegKit } from 'ffmpeg-kit-react-native';
 import { createThumbnail } from 'react-native-create-thumbnail';
-import ffmpegKit from 'ffmpeg-kit-react-native';
 
-// Max dimensions for images
-const MAX_IMAGE_WIDTH = 1200;
-const MAX_IMAGE_HEIGHT = 1200;
+// Maximum dimensions for uploaded images
+const MAX_IMAGE_DIMENSION = 1200;
+const MAX_IMAGE_SIZE_MB = 5;
+const MAX_THUMBNAIL_DIMENSION = 500;
+const IMAGE_QUALITY = 80;
 
-// Max dimensions for thumbnails
-const MAX_THUMBNAIL_WIDTH = 300;
-const MAX_THUMBNAIL_HEIGHT = 300;
-
-// Max video size in bytes (20MB)
-const MAX_VIDEO_SIZE = 20 * 1024 * 1024;
-
-// Max video duration in seconds
-const MAX_VIDEO_DURATION = 120;
-
-// MIME types for common image formats
-const IMAGE_MIME_TYPES = {
-  jpg: 'image/jpeg',
-  jpeg: 'image/jpeg',
-  png: 'image/png',
-  heic: 'image/heic',
-  heif: 'image/heif',
-  webp: 'image/webp',
-};
-
-// MIME types for common video formats
-const VIDEO_MIME_TYPES = {
-  mp4: 'video/mp4',
-  mov: 'video/quicktime',
-  m4v: 'video/x-m4v',
-  '3gp': 'video/3gpp',
-};
+// Video constants
+const MAX_VIDEO_DIMENSION = 720;
+const MAX_VIDEO_SIZE_MB = 50;
+const MAX_VIDEO_DURATION_SEC = 120;
+const VIDEO_BITRATE = '2M';
 
 /**
- * Process an image for upload (resize, compress, convert)
- * @param {Object} imageAsset - Image asset from image picker
- * @returns {Promise<Object>} Processed image info
+ * Process an image before upload (resize and compress)
+ * @param {Object} image - Image object from image picker
+ * @returns {Promise<Object>} Processed image
  */
-export const processImage = async (imageAsset) => {
-  try {
-    // Determine if we need to resize
-    const needsResize = 
-      (imageAsset.width > MAX_IMAGE_WIDTH || imageAsset.height > MAX_IMAGE_HEIGHT);
-    
-    // Check if the image needs conversion (HEIC/HEIF to JPEG)
-    const needsConversion = 
-      imageAsset.type === 'image/heic' || 
-      imageAsset.type === 'image/heif' ||
-      (imageAsset.uri && (
-        imageAsset.uri.toLowerCase().endsWith('heic') ||
-        imageAsset.uri.toLowerCase().endsWith('heif')
-      ));
-    
-    // Early return if no processing needed
-    if (!needsResize && !needsConversion) {
-      return imageAsset;
-    }
-    
-    // Generate a target width and height that maintains aspect ratio
-    let targetWidth = imageAsset.width;
-    let targetHeight = imageAsset.height;
-    
-    if (needsResize) {
-      const aspectRatio = imageAsset.width / imageAsset.height;
-      
-      if (imageAsset.width > imageAsset.height) {
-        // Landscape orientation
-        targetWidth = Math.min(imageAsset.width, MAX_IMAGE_WIDTH);
-        targetHeight = Math.round(targetWidth / aspectRatio);
-      } else {
-        // Portrait orientation
-        targetHeight = Math.min(imageAsset.height, MAX_IMAGE_HEIGHT);
-        targetWidth = Math.round(targetHeight * aspectRatio);
-      }
-    }
-    
-    // Determine output format - convert HEIC/HEIF to JPEG
-    const outputFormat = needsConversion ? 'JPEG' : 
-      (imageAsset.type === 'image/png' ? 'PNG' : 'JPEG');
-    
-    // Resize and possibly convert format
-    const processedImage = await ImageResizer.createResizedImage(
-      imageAsset.uri,
-      targetWidth,
-      targetHeight,
-      outputFormat,
-      90, // quality
-      0, // rotation
-      null, // output path (null = temp directory)
-      false, // keep metadata
-      { onlyScaleDown: true } // options
-    );
-    
-    // Get file size of the processed image
-    const fileInfo = await RNFS.stat(processedImage.uri);
-    
-    return {
-      uri: processedImage.uri,
-      width: processedImage.width,
-      height: processedImage.height,
-      type: outputFormat === 'JPEG' ? 'image/jpeg' : 'image/png',
-      name: processedImage.name || `image_${Date.now()}.${outputFormat.toLowerCase()}`,
-      size: fileInfo.size,
-    };
-  } catch (error) {
-    console.error('Error processing image:', error);
-    // If processing fails, return the original image
-    return imageAsset;
+export const processImage = async (image) => {
+  if (!image || !image.uri) {
+    throw new Error('Invalid image object');
   }
-};
-
-/**
- * Process a video for upload (compress, convert, generate thumbnail)
- * @param {Object} videoAsset - Video asset from picker
- * @returns {Promise<Object>} Processed video info with thumbnail
- */
-export const processVideo = async (videoAsset) => {
+  
   try {
-    // Check if video needs processing (too large or unsupported format)
-    const needsProcessing = 
-      videoAsset.fileSize > MAX_VIDEO_SIZE ||
-      (videoAsset.duration && videoAsset.duration > MAX_VIDEO_DURATION * 1000) ||
-      (Platform.OS === 'ios' && videoAsset.uri.toLowerCase().endsWith('mov'));
+    // Check if image needs resizing
+    const needsResize = (image.width > MAX_IMAGE_DIMENSION || image.height > MAX_IMAGE_DIMENSION);
+    let processedUri = image.uri;
     
-    let processedVideo = { ...videoAsset };
-    
-    if (needsProcessing) {
-      // Generate a unique output path
-      const timestamp = Date.now();
-      const outputPath = `${RNFS.CachesDirectoryPath}/processed_video_${timestamp}.mp4`;
+    // Resize if needed
+    if (needsResize) {
+      // Calculate new dimensions while maintaining aspect ratio
+      let newWidth, newHeight;
+      if (image.width > image.height) {
+        newWidth = MAX_IMAGE_DIMENSION;
+        newHeight = Math.floor(image.height * (MAX_IMAGE_DIMENSION / image.width));
+      } else {
+        newHeight = MAX_IMAGE_DIMENSION;
+        newWidth = Math.floor(image.width * (MAX_IMAGE_DIMENSION / image.height));
+      }
       
-      // Determine the target duration
-      const targetDuration = Math.min(
-        videoAsset.duration ? videoAsset.duration / 1000 : MAX_VIDEO_DURATION,
-        MAX_VIDEO_DURATION
+      // Resize the image
+      const resizeResult = await ImageResizer.createResizedImage(
+        image.uri,
+        newWidth,
+        newHeight,
+        'JPEG',
+        IMAGE_QUALITY,
+        0,
+        undefined,
+        false,
+        { mode: 'contain', onlyScaleDown: true }
       );
       
-      // Build FFmpeg command
-      let command = `-i "${videoAsset.uri}" -c:v libx264 -preset medium -crf 28 -c:a aac -b:a 128k`;
-      
-      // Add duration limit if needed
-      if (videoAsset.duration && videoAsset.duration > MAX_VIDEO_DURATION * 1000) {
-        command = `${command} -t ${targetDuration}`;
-      }
-      
-      // Add output options
-      command = `${command} -movflags +faststart -pix_fmt yuv420p "${outputPath}"`;
-      
-      // Execute FFmpeg command to process video
-      const result = await ffmpegKit.execute(command);
-      
-      if (result.getReturnCode() === 0) {
-        // Processing successful, get info about the processed file
-        const fileInfo = await RNFS.stat(outputPath);
-        
-        processedVideo = {
-          uri: outputPath,
-          type: 'video/mp4',
-          fileSize: fileInfo.size,
-          duration: videoAsset.duration > MAX_VIDEO_DURATION * 1000 ? 
-            MAX_VIDEO_DURATION * 1000 : videoAsset.duration,
-          name: `video_${timestamp}.mp4`,
-        };
-      } else {
-        console.warn('Video processing failed, using original video');
-      }
+      processedUri = resizeResult.uri;
     }
     
-    // Generate a thumbnail for the video
-    const thumbnail = await createThumbnail({
-      url: processedVideo.uri,
-      timeStamp: 1000, // 1 second into the video
-      quality: 0.8,
+    // Compress the image
+    const compressedUri = await Image.compress(processedUri, {
+      compressionMethod: 'auto',
+      maxWidth: MAX_IMAGE_DIMENSION,
+      maxHeight: MAX_IMAGE_DIMENSION,
+      quality: IMAGE_QUALITY / 100,
     });
     
-    // Resize thumbnail if needed
-    let thumbnailInfo = thumbnail;
+    // Check final file size
+    const fileInfo = await RNFS.stat(compressedUri);
+    const fileSizeMB = fileInfo.size / (1024 * 1024);
     
-    if (thumbnail.width > MAX_THUMBNAIL_WIDTH || thumbnail.height > MAX_THUMBNAIL_HEIGHT) {
-      const aspectRatio = thumbnail.width / thumbnail.height;
-      let targetWidth, targetHeight;
-      
-      if (thumbnail.width > thumbnail.height) {
-        targetWidth = MAX_THUMBNAIL_WIDTH;
-        targetHeight = Math.round(targetWidth / aspectRatio);
-      } else {
-        targetHeight = MAX_THUMBNAIL_HEIGHT;
-        targetWidth = Math.round(targetHeight * aspectRatio);
-      }
-      
-      const resizedThumbnail = await ImageResizer.createResizedImage(
-        thumbnail.path,
-        targetWidth,
-        targetHeight,
-        'JPEG',
-        80,
-        0,
-        null,
-        false
-      );
-      
-      thumbnailInfo = {
-        ...thumbnail,
-        path: resizedThumbnail.uri,
-        width: resizedThumbnail.width,
-        height: resizedThumbnail.height,
-      };
-    }
-    
-    return {
-      ...processedVideo,
-      thumbnail: thumbnailInfo.path,
-      thumbnailWidth: thumbnailInfo.width,
-      thumbnailHeight: thumbnailInfo.height,
-    };
-  } catch (error) {
-    console.error('Error processing video:', error);
-    
-    // If video processing fails, try to at least generate a thumbnail
-    try {
-      const thumbnail = await createThumbnail({
-        url: videoAsset.uri,
-        timeStamp: 1000,
+    if (fileSizeMB > MAX_IMAGE_SIZE_MB) {
+      // Further compress if still too large
+      const extraCompressedUri = await Image.compress(compressedUri, {
+        compressionMethod: 'auto',
+        maxWidth: MAX_IMAGE_DIMENSION,
+        maxHeight: MAX_IMAGE_DIMENSION,
+        quality: (IMAGE_QUALITY - 20) / 100, // Lower quality for larger files
       });
       
       return {
-        ...videoAsset,
-        thumbnail: thumbnail.path,
-        thumbnailWidth: thumbnail.width,
-        thumbnailHeight: thumbnail.height,
+        uri: extraCompressedUri,
+        type: 'image/jpeg',
+        name: image.fileName || `image_${Date.now()}.jpg`,
+        width: newWidth || image.width,
+        height: newHeight || image.height,
       };
-    } catch (thumbError) {
-      console.error('Error generating thumbnail:', thumbError);
-      // Return the original video if all processing fails
-      return videoAsset;
     }
+    
+    return {
+      uri: compressedUri,
+      type: 'image/jpeg',
+      name: image.fileName || `image_${Date.now()}.jpg`,
+      width: newWidth || image.width,
+      height: newHeight || image.height,
+    };
+  } catch (error) {
+    console.error('Error processing image:', error);
+    throw error;
   }
 };
 
 /**
- * Get the MIME type for a file based on extension
- * @param {string} path - File path
- * @returns {string} MIME type or fallback
+ * Create a thumbnail from an image
+ * @param {string} imageUri - URI of the image
+ * @returns {Promise<string>} URI of the thumbnail
  */
-export const getMimeType = (path) => {
-  if (!path) return 'application/octet-stream';
-  
-  const extension = path.split('.').pop().toLowerCase();
-  
-  if (IMAGE_MIME_TYPES[extension]) {
-    return IMAGE_MIME_TYPES[extension];
+export const createImageThumbnail = async (imageUri) => {
+  try {
+    // Resize the image to thumbnail size
+    const result = await ImageResizer.createResizedImage(
+      imageUri,
+      MAX_THUMBNAIL_DIMENSION,
+      MAX_THUMBNAIL_DIMENSION,
+      'JPEG',
+      70,
+      0,
+      undefined,
+      false,
+      { mode: 'contain', onlyScaleDown: true }
+    );
+    
+    return result.uri;
+  } catch (error) {
+    console.error('Error creating image thumbnail:', error);
+    throw error;
   }
-  
-  if (VIDEO_MIME_TYPES[extension]) {
-    return VIDEO_MIME_TYPES[extension];
-  }
-  
-  return 'application/octet-stream';
 };
 
 /**
- * Check if a file is an image based on path or MIME type
- * @param {string} path - File path
- * @param {string} mimeType - Optional MIME type
- * @returns {boolean} True if the file is an image
+ * Process a video before upload (resize, compress, create thumbnail)
+ * @param {Object} video - Video object from video picker
+ * @returns {Promise<Object>} Processed video with thumbnail
  */
-export const isImage = (path, mimeType) => {
-  if (!path) return false;
-  
-  if (mimeType) {
-    return mimeType.startsWith('image/');
+export const processVideo = async (video) => {
+  if (!video || !video.uri) {
+    throw new Error('Invalid video object');
   }
   
-  const extension = path.split('.').pop().toLowerCase();
-  return Object.keys(IMAGE_MIME_TYPES).includes(extension);
+  try {
+    // Check video duration if available
+    if (video.duration && video.duration > MAX_VIDEO_DURATION_SEC * 1000) {
+      throw new Error(`Video duration exceeds the maximum limit of ${MAX_VIDEO_DURATION_SEC} seconds`);
+    }
+    
+    // Original file size
+    const fileInfo = await RNFS.stat(video.uri);
+    const fileSizeMB = fileInfo.size / (1024 * 1024);
+    
+    // Compression required if file is too large
+    const needsCompression = fileSizeMB > MAX_VIDEO_SIZE_MB;
+    let processedUri = video.uri;
+    
+    if (needsCompression) {
+      if (Platform.OS === 'android') {
+        // For Android, use FFmpeg for more reliable processing
+        const outputPath = `${RNFS.CachesDirectoryPath}/compressed_${Date.now()}.mp4`;
+        
+        // FFmpeg command for compressing video
+        const command = `-i ${video.uri} -vf "scale='min(${MAX_VIDEO_DIMENSION},iw)':'min(${MAX_VIDEO_DIMENSION},ih)'" -c:v libx264 -preset fast -crf 28 -c:a aac -b:a 128k -movflags +faststart ${outputPath}`;
+        
+        // Execute the command
+        await FFmpegKit.execute(command);
+        
+        // Check if output file exists
+        const exists = await RNFS.exists(outputPath);
+        if (!exists) {
+          throw new Error('Video compression failed');
+        }
+        
+        processedUri = outputPath;
+      } else {
+        // For iOS, use react-native-compressor
+        processedUri = await Video.compress(
+          video.uri,
+          {
+            compressionMethod: 'auto',
+            maxSize: MAX_VIDEO_SIZE_MB * 1024 * 1024, // Convert to bytes
+            minimumFileSizeForCompress: 1024 * 1024, // 1MB minimum
+          }
+        );
+      }
+    }
+    
+    // Create thumbnail
+    const thumbnail = await createThumbnail({
+      url: processedUri,
+      timeStamp: 1000, // 1 second into the video
+      quality: 0.8,
+      cacheName: `thumb_${Date.now()}`,
+    });
+    
+    // Check final file size after compression
+    const finalFileInfo = await RNFS.stat(processedUri);
+    const finalFileSizeMB = finalFileInfo.size / (1024 * 1024);
+    
+    if (finalFileSizeMB > MAX_VIDEO_SIZE_MB * 1.5) {
+      throw new Error(`Video is too large (${finalFileSizeMB.toFixed(2)} MB) even after compression`);
+    }
+    
+    return {
+      uri: processedUri,
+      thumbnailUri: thumbnail.path,
+      type: 'video/mp4',
+      name: video.fileName || `video_${Date.now()}.mp4`,
+      size: finalFileInfo.size,
+    };
+  } catch (error) {
+    console.error('Error processing video:', error);
+    throw error;
+  }
 };
 
 /**
- * Check if a file is a video based on path or MIME type
- * @param {string} path - File path
- * @param {string} mimeType - Optional MIME type
- * @returns {boolean} True if the file is a video
+ * Check if a file is too large for upload
+ * @param {number} fileSize - File size in bytes
+ * @param {string} fileType - MIME type of the file
+ * @returns {boolean} Whether the file is too large
  */
-export const isVideo = (path, mimeType) => {
-  if (!path) return false;
-  
-  if (mimeType) {
-    return mimeType.startsWith('video/');
+export const isFileTooLarge = (fileSize, fileType) => {
+  const fileSizeMB = fileSize / (1024 * 1024);
+  if (fileType.startsWith('image')) {
+    return fileSizeMB > MAX_IMAGE_SIZE_MB;
+  } else if (fileType.startsWith('video')) {
+    return fileSizeMB > MAX_VIDEO_SIZE_MB;
   }
-  
-  const extension = path.split('.').pop().toLowerCase();
-  return Object.keys(VIDEO_MIME_TYPES).includes(extension);
+  // Default to true for unknown file types
+  return true;
 };
 
 /**
- * Format file size in human-readable format
- * @param {number} bytes - File size in bytes
- * @returns {string} Formatted file size
+ * Get file extension from mime type
+ * @param {string} mimeType - MIME type
+ * @returns {string} File extension
  */
-export const formatFileSize = (bytes) => {
-  if (bytes === 0) return '0 Bytes';
-  
-  const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(1024));
-  
-  return parseFloat((bytes / Math.pow(1024, i)).toFixed(2)) + ' ' + sizes[i];
+export const getFileExtensionFromMimeType = (mimeType) => {
+  switch (mimeType) {
+    case 'image/jpeg':
+      return 'jpg';
+    case 'image/png':
+      return 'png';
+    case 'image/gif':
+      return 'gif';
+    case 'image/heic':
+      return 'heic';
+    case 'image/heif':
+      return 'heif';
+    case 'video/mp4':
+      return 'mp4';
+    case 'video/quicktime':
+      return 'mov';
+    case 'video/x-msvideo':
+      return 'avi';
+    default:
+      return 'dat';
+  }
+};
+
+export default {
+  processImage,
+  createImageThumbnail,
+  processVideo,
+  isFileTooLarge,
+  getFileExtensionFromMimeType,
+  MAX_IMAGE_SIZE_MB,
+  MAX_VIDEO_SIZE_MB,
+  MAX_VIDEO_DURATION_SEC,
 };
