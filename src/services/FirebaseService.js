@@ -1,324 +1,528 @@
 // src/services/FirebaseService.js
-// Centralized Firebase service with updated imports
+// Centralized Firebase services for the application
 
 import auth from '@react-native-firebase/auth';
 import firestore from '@react-native-firebase/firestore';
 import storage from '@react-native-firebase/storage';
-import { Alert } from 'react-native';
+import { Platform } from 'react-native';
+import { getMimeType } from '../utils/mediaProcessing';
 
 /**
- * Authentication Service
- * Handles user authentication functions
+ * Authentication service for Firebase
  */
 export const AuthService = {
   /**
    * Sign in with email and password
-   * 
    * @param {string} email - User email
    * @param {string} password - User password
-   * @returns {Promise<UserCredential>} Firebase user credential
+   * @returns {Promise<UserCredential>} Firebase auth user credential
    */
   signIn: async (email, password) => {
-    try {
-      return await auth().signInWithEmailAndPassword(email, password);
-    } catch (error) {
-      console.error('Sign in error:', error);
-      throw error;
-    }
+    return await auth().signInWithEmailAndPassword(email, password);
   },
 
   /**
    * Sign up with email and password
-   * 
    * @param {string} email - User email
    * @param {string} password - User password
-   * @returns {Promise<UserCredential>} Firebase user credential
+   * @returns {Promise<UserCredential>} Firebase auth user credential
    */
   signUp: async (email, password) => {
-    try {
-      return await auth().createUserWithEmailAndPassword(email, password);
-    } catch (error) {
-      console.error('Sign up error:', error);
-      throw error;
-    }
+    return await auth().createUserWithEmailAndPassword(email, password);
   },
 
   /**
-   * Sign out current user
-   * 
+   * Sign out the current user
    * @returns {Promise<void>}
    */
   signOut: async () => {
-    try {
-      return await auth().signOut();
-    } catch (error) {
-      console.error('Sign out error:', error);
-      throw error;
-    }
+    return await auth().signOut();
   },
 
   /**
-   * Reset password for email
-   * 
+   * Send password reset email
    * @param {string} email - User email
    * @returns {Promise<void>}
    */
   resetPassword: async (email) => {
-    try {
-      return await auth().sendPasswordResetEmail(email);
-    } catch (error) {
-      console.error('Reset password error:', error);
-      throw error;
-    }
+    return await auth().sendPasswordResetEmail(email);
   },
 
   /**
-   * Update user profile
-   * 
-   * @param {Object} user - Firebase user object
-   * @param {Object} profileData - Profile data to update
+   * Update user profile in auth and firestore
+   * @param {FirebaseUser} user - Firebase auth user
+   * @param {Object} profileData - User profile data
    * @returns {Promise<void>}
    */
   updateProfile: async (user, profileData) => {
+    // First, update any firebase auth fields if present
+    const authUpdates = {};
+    
+    if (profileData.email) {
+      authUpdates.email = profileData.email;
+    }
+    
+    if (profileData.displayName || (profileData.firstName && profileData.lastName)) {
+      authUpdates.displayName = profileData.displayName || 
+        `${profileData.firstName} ${profileData.lastName}`.trim();
+    }
+    
+    if (profileData.photoURL || profileData.profileImageURL) {
+      authUpdates.photoURL = profileData.photoURL || profileData.profileImageURL;
+    }
+    
+    if (Object.keys(authUpdates).length > 0) {
+      await user.updateProfile(authUpdates);
+    }
+    
+    // Then update user document in Firestore
+    if (user.uid) {
+      await firestore()
+        .collection('users')
+        .doc(user.uid)
+        .set({
+          ...profileData,
+          id: user.uid,
+          updatedAt: firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+    }
+  },
+
+  /**
+   * Delete user account
+   * @returns {Promise<void>}
+   */
+  deleteAccount: async () => {
+    const user = auth().currentUser;
+    if (!user) throw new Error('No user is currently signed in');
+    
+    // Delete user's firestore document
+    await firestore().collection('users').doc(user.uid).delete();
+    
+    // Delete user's auth account
+    return await user.delete();
+  }
+};
+
+/**
+ * Post service for managing posts
+ */
+export const PostService = {
+  /**
+   * Create a new post
+   * @param {Object} postData - Post data
+   * @returns {Promise<string>} Post ID
+   */
+  createPost: async (postData) => {
     try {
-      // Update firestore user document
-      const { displayName, photoURL, ...otherData } = profileData;
+      // Add timestamp and initialize counts
+      const enhancedPostData = {
+        ...postData,
+        timestamp: firestore.FieldValue.serverTimestamp(),
+        likeCount: 0,
+        commentCount: 0,
+        shareCount: 0
+      };
       
-      // Update auth profile if displayName or photoURL provided
-      if (displayName || photoURL) {
-        const updateData = {};
-        if (displayName) updateData.displayName = displayName;
-        if (photoURL) updateData.photoURL = photoURL;
-        
-        await user.updateProfile(updateData);
-      }
-      
-      // Update additional data in Firestore if provided
-      if (Object.keys(otherData).length > 0) {
-        await firestore().collection('users').doc(user.uid).update(otherData);
-      }
+      // Add to Firestore
+      const docRef = await firestore().collection('posts').add(enhancedPostData);
+      return docRef.id;
     } catch (error) {
-      console.error('Update profile error:', error);
+      console.error('Error creating post:', error);
       throw error;
     }
   },
 
   /**
-   * Set up auth state change listener
-   * 
-   * @param {Function} callback - Callback function when auth state changes
-   * @returns {Function} Unsubscribe function
+   * Get posts for the feed
+   * @param {string} userId - Current user ID
+   * @param {Array<string>} blockedUsers - List of blocked user IDs
+   * @param {number} limit - Number of posts to fetch
+   * @param {FirestoreDocumentSnapshot} startAfter - Starting point for pagination
+   * @returns {Promise<Object>} Object containing posts and pagination info
    */
-  onAuthStateChanged: (callback) => {
-    return auth().onAuthStateChanged(callback);
-  },
-
-  /**
-   * Get current user
-   * 
-   * @returns {Object|null} Current Firebase user or null
-   */
-  getCurrentUser: () => {
-    return auth().currentUser;
-  }
-};
-
-/**
- * User Service
- * Handles user data operations
- */
-export const UserService = {
-  /**
-   * Get user by ID
-   * 
-   * @param {string} userId - User ID
-   * @returns {Promise<Object>} User data
-   */
-  getUserById: async (userId) => {
+  getFeedPosts: async (userId, blockedUsers = [], limit = 10, startAfter = null) => {
     try {
-      const userDoc = await firestore().collection('users').doc(userId).get();
+      // Get user's connections (people they follow)
+      const connectionsSnapshot = await firestore()
+        .collection('connections')
+        .where('userId', '==', userId)
+        .get();
+
+      // Extract connected user IDs and filter out blocked users
+      let connectedUserIds = connectionsSnapshot.docs
+        .map(doc => doc.data().connectedUserId)
+        .filter(id => !blockedUsers.includes(id));
+
+      // Add current user's ID to include their own posts
+      const userIds = [...connectedUserIds, userId]
+        .filter(id => !blockedUsers.includes(id));
       
-      if (!userDoc.exists) {
-        throw new Error('User not found');
+      // If no connections and just the user, we'll still query but might get empty results
+      let query = firestore()
+        .collection('posts')
+        .where('userId', 'in', userIds.length > 0 ? userIds.slice(0, Math.min(userIds.length, 10)) : ['NO_RESULTS'])
+        .orderBy('timestamp', 'desc');
+        
+      if (startAfter) {
+        query = query.startAfter(startAfter);
       }
+      
+      query = query.limit(limit);
+      const snapshot = await query.get();
+      
+      const posts = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data(),
+        timestamp: doc.data().timestamp?.toDate() || new Date()
+      }));
       
       return {
-        id: userDoc.id,
-        ...userDoc.data(),
-        joinDate: userDoc.data().joinDate?.toDate() || null
+        posts,
+        lastDoc: snapshot.docs.length > 0 ? snapshot.docs[snapshot.docs.length - 1] : null,
+        hasMore: snapshot.docs.length === limit
       };
     } catch (error) {
-      console.error('Get user error:', error);
+      console.error('Error fetching feed posts:', error);
       throw error;
     }
   },
-
+  
   /**
-   * Update user profile
-   * 
+   * Get posts by a specific user
    * @param {string} userId - User ID
-   * @param {Object} data - Profile data to update
-   * @returns {Promise<void>}
+   * @param {number} limit - Number of posts to fetch
+   * @param {FirestoreDocumentSnapshot} startAfter - Starting point for pagination
+   * @returns {Promise<Object>} Object containing posts and pagination info
    */
-  updateProfile: async (userId, data) => {
+  getUserPosts: async (userId, limit = 20, startAfter = null) => {
     try {
-      return await firestore().collection('users').doc(userId).update(data);
-    } catch (error) {
-      console.error('Update profile error:', error);
-      throw error;
-    }
-  },
-
-  /**
-   * Find users by condition
-   * 
-   * @param {string} condition - Medical condition to search
-   * @param {number} limit - Maximum number of results
-   * @returns {Promise<Array>} List of users
-   */
-  findUsersByCondition: async (condition, limit = 20) => {
-    try {
-      const snapshot = await firestore()
-        .collection('users')
-        .where('medicalConditions', 'array-contains', condition)
-        .limit(limit)
-        .get();
-      
-      return snapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data(),
-        joinDate: doc.data().joinDate?.toDate() || null
-      }));
-    } catch (error) {
-      console.error('Find users error:', error);
-      throw error;
-    }
-  },
-
-  /**
-   * Search users by name or email
-   * 
-   * @param {string} query - Search query
-   * @param {number} limit - Maximum number of results
-   * @returns {Promise<Array>} List of users
-   */
-  searchUsers: async (query, limit = 20) => {
-    try {
-      // Firebase doesn't support text search directly
-      // This is a simple implementation that searches for users
-      // whose name starts with the query
-      const snapshot = await firestore()
-        .collection('users')
-        .orderBy('firstName')
-        .startAt(query)
-        .endAt(query + '\uf8ff')
-        .limit(limit)
-        .get();
-      
-      return snapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data(),
-        joinDate: doc.data().joinDate?.toDate() || null
-      }));
-    } catch (error) {
-      console.error('Search users error:', error);
-      throw error;
-    }
-  }
-};
-
-/**
- * Block Service
- * Handles user blocking functionality
- */
-export const BlockService = {
-  /**
-   * Block a user
-   * 
-   * @param {string} userId - Current user ID
-   * @param {string} blockedUserId - User ID to block
-   * @param {string} reason - Reason for blocking
-   * @returns {Promise<void>}
-   */
-  blockUser: async (userId, blockedUserId, reason = '') => {
-    try {
-      return await firestore().collection('blockedUsers').add({
-        blockedBy: userId,
-        blockedUserId,
-        reason,
-        timestamp: firestore.FieldValue.serverTimestamp()
-      });
-    } catch (error) {
-      console.error('Block user error:', error);
-      throw error;
-    }
-  },
-
-  /**
-   * Unblock a user
-   * 
-   * @param {string} userId - Current user ID
-   * @param {string} blockedUserId - User ID to unblock
-   * @returns {Promise<void>}
-   */
-  unblockUser: async (userId, blockedUserId) => {
-    try {
-      const snapshot = await firestore()
-        .collection('blockedUsers')
-        .where('blockedBy', '==', userId)
-        .where('blockedUserId', '==', blockedUserId)
-        .get();
-      
-      if (snapshot.empty) {
-        return;
+      let query = firestore()
+        .collection('posts')
+        .where('userId', '==', userId)
+        .orderBy('timestamp', 'desc');
+        
+      if (startAfter) {
+        query = query.startAfter(startAfter);
       }
       
-      // Create a batch to delete all matching documents
+      query = query.limit(limit);
+      const snapshot = await query.get();
+      
+      const posts = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data(),
+        timestamp: doc.data().timestamp?.toDate() || new Date()
+      }));
+      
+      return {
+        posts,
+        lastDoc: snapshot.docs.length > 0 ? snapshot.docs[snapshot.docs.length - 1] : null,
+        hasMore: snapshot.docs.length === limit
+      };
+    } catch (error) {
+      console.error('Error fetching user posts:', error);
+      throw error;
+    }
+  },
+  
+  /**
+   * Delete a post
+   * @param {string} postId - Post ID
+   * @returns {Promise<void>}
+   */
+  deletePost: async (postId) => {
+    try {
+      // First, get the post to check if there are media files to delete
+      const postDoc = await firestore().collection('posts').doc(postId).get();
+      
+      if (!postDoc.exists) {
+        throw new Error('Post not found');
+      }
+      
+      const postData = postDoc.data();
+      
+      // Delete associated media from storage if present
+      if (postData.content && postData.content.startsWith('https://')) {
+        try {
+          // Try to get a storage reference from the URL
+          const storageRef = storage().refFromURL(postData.content);
+          await storageRef.delete();
+        } catch (storageError) {
+          // Silently handle storage deletion errors
+          console.warn('Could not delete media file:', storageError);
+        }
+      }
+      
+      // Delete comments associated with the post
+      const commentsSnapshot = await firestore()
+        .collection('comments')
+        .where('postId', '==', postId)
+        .get();
+      
       const batch = firestore().batch();
-      snapshot.docs.forEach(doc => {
+      
+      commentsSnapshot.docs.forEach(doc => {
         batch.delete(doc.ref);
       });
       
-      return await batch.commit();
+      // Delete likes associated with the post
+      const likesSnapshot = await firestore()
+        .collection('likes')
+        .where('postId', '==', postId)
+        .get();
+      
+      likesSnapshot.docs.forEach(doc => {
+        batch.delete(doc.ref);
+      });
+      
+      // Delete the post document
+      batch.delete(firestore().collection('posts').doc(postId));
+      
+      // Commit the batch
+      await batch.commit();
     } catch (error) {
-      console.error('Unblock user error:', error);
+      console.error('Error deleting post:', error);
       throw error;
     }
   },
-
+  
   /**
-   * Check if user is blocked
-   * 
-   * @param {string} userId - Current user ID
-   * @param {string} otherUserId - User ID to check
-   * @returns {Promise<boolean>} Whether the user is blocked
+   * Like or unlike a post
+   * @param {string} postId - Post ID
+   * @param {string} userId - User ID
+   * @param {boolean} like - Whether to like or unlike
+   * @returns {Promise<boolean>} Whether the operation changed the like status
    */
-  isUserBlocked: async (userId, otherUserId) => {
+  toggleLike: async (postId, userId, like = true) => {
+    try {
+      // Find existing like document if any
+      const likeQuery = await firestore()
+        .collection('likes')
+        .where('postId', '==', postId)
+        .where('userId', '==', userId)
+        .limit(1)
+        .get();
+      
+      // Use a transaction to ensure consistency
+      return await firestore().runTransaction(async (transaction) => {
+        // Get the current post
+        const postRef = firestore().collection('posts').doc(postId);
+        const postDoc = await transaction.get(postRef);
+        
+        if (!postDoc.exists) {
+          throw new Error('Post not found');
+        }
+        
+        // Current like count
+        const currentLikeCount = postDoc.data().likeCount || 0;
+        
+        // Check if like already exists
+        const likeExists = !likeQuery.empty;
+        
+        if (like && !likeExists) {
+          // Add like and increment count
+          const newLikeRef = firestore().collection('likes').doc();
+          transaction.set(newLikeRef, {
+            postId,
+            userId,
+            timestamp: firestore.FieldValue.serverTimestamp()
+          });
+          transaction.update(postRef, { likeCount: currentLikeCount + 1 });
+          return true;
+        } else if (!like && likeExists) {
+          // Remove like and decrement count
+          transaction.delete(likeQuery.docs[0].ref);
+          transaction.update(postRef, { 
+            likeCount: Math.max(0, currentLikeCount - 1) 
+          });
+          return true;
+        }
+        
+        // No change needed
+        return false;
+      });
+    } catch (error) {
+      console.error('Error toggling like:', error);
+      throw error;
+    }
+  },
+  
+  /**
+   * Check if a user has liked a post
+   * @param {string} postId - Post ID
+   * @param {string} userId - User ID
+   * @returns {Promise<boolean>} Whether the user has liked the post
+   */
+  checkLikeStatus: async (postId, userId) => {
     try {
       const snapshot = await firestore()
-        .collection('blockedUsers')
-        .where('blockedBy', '==', userId)
-        .where('blockedUserId', '==', otherUserId)
+        .collection('likes')
+        .where('postId', '==', postId)
+        .where('userId', '==', userId)
+        .limit(1)
         .get();
       
       return !snapshot.empty;
     } catch (error) {
-      console.error('Check blocked error:', error);
+      console.error('Error checking like status:', error);
+      throw error;
+    }
+  }
+};
+
+/**
+ * Upload service for managing file uploads
+ */
+export const UploadService = {
+  /**
+   * Upload an image to Firebase Storage
+   * @param {string} uri - Local URI of the image
+   * @param {string} storagePath - Path in Firebase Storage
+   * @param {Function} onProgress - Progress callback
+   * @returns {Promise<string>} Download URL
+   */
+  uploadImage: async (uri, storagePath, onProgress = null) => {
+    try {
+      const reference = storage().ref(storagePath);
+      
+      // Create upload task
+      const task = reference.putFile(uri);
+      
+      // Monitor upload progress
+      if (onProgress) {
+        task.on('state_changed', snapshot => {
+          const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
+          onProgress(progress);
+        });
+      }
+      
+      // Wait for upload to complete
+      await task;
+      
+      // Get download URL
+      return await reference.getDownloadURL();
+    } catch (error) {
+      console.error('Error uploading image:', error);
       throw error;
     }
   },
-
+  
   /**
-   * Get blocked users details
-   * 
-   * @param {string} userId - Current user ID
-   * @returns {Promise<Array>} Blocked users details
+   * Upload a video to Firebase Storage
+   * @param {string} uri - Local URI of the video
+   * @param {string} storagePath - Path in Firebase Storage
+   * @param {Function} onProgress - Progress callback
+   * @returns {Promise<string>} Download URL
+   */
+  uploadVideo: async (uri, storagePath, onProgress = null) => {
+    try {
+      const reference = storage().ref(storagePath);
+      
+      // Create upload task
+      const task = reference.putFile(uri);
+      
+      // Monitor upload progress
+      if (onProgress) {
+        task.on('state_changed', snapshot => {
+          const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
+          onProgress(progress);
+        });
+      }
+      
+      // Wait for upload to complete
+      await task;
+      
+      // Get download URL
+      return await reference.getDownloadURL();
+    } catch (error) {
+      console.error('Error uploading video:', error);
+      throw error;
+    }
+  },
+  
+  /**
+   * Upload any file to Firebase Storage
+   * @param {string} uri - Local URI of the file
+   * @param {string} storagePath - Path in Firebase Storage
+   * @param {string} mimeType - MIME type of the file
+   * @param {Function} onProgress - Progress callback
+   * @returns {Promise<string>} Download URL
+   */
+  uploadFile: async (uri, storagePath, mimeType = null, onProgress = null) => {
+    try {
+      const reference = storage().ref(storagePath);
+      
+      // Fix for file:// URIs on Android
+      const filePath = Platform.OS === 'android' && uri.startsWith('file://') 
+        ? uri.substring(7) 
+        : uri;
+      
+      // Detect MIME type if not provided
+      const contentType = mimeType || getMimeType(uri);
+      
+      // Create metadata
+      const metadata = {
+        contentType,
+      };
+      
+      // Create upload task
+      const task = reference.putFile(filePath, metadata);
+      
+      // Monitor upload progress
+      if (onProgress) {
+        task.on('state_changed', snapshot => {
+          const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
+          onProgress(progress);
+        });
+      }
+      
+      // Wait for upload to complete
+      await task;
+      
+      // Get download URL
+      return await reference.getDownloadURL();
+    } catch (error) {
+      console.error('Error uploading file:', error);
+      throw error;
+    }
+  },
+  
+  /**
+   * Delete a file from Firebase Storage
+   * @param {string} url - File URL
+   * @returns {Promise<void>}
+   */
+  deleteFile: async (url) => {
+    try {
+      if (!url || !url.startsWith('https://')) {
+        return;
+      }
+      
+      const reference = storage().refFromURL(url);
+      await reference.delete();
+    } catch (error) {
+      console.error('Error deleting file:', error);
+      throw error;
+    }
+  }
+};
+
+/**
+ * Block service for managing blocked users
+ */
+export const BlockService = {
+  /**
+   * Get details of blocked users
+   * @param {string} userId - User ID
+   * @returns {Promise<Array>} Array of blocked user details
    */
   getBlockedUserDetails: async (userId) => {
     try {
+      // Get blocked users IDs
       const blockedSnapshot = await firestore()
-        .collection('blockedUsers')
-        .where('blockedBy', '==', userId)
+        .collection('blocks')
+        .where('userId', '==', userId)
         .get();
       
       if (blockedSnapshot.empty) {
@@ -326,800 +530,225 @@ export const BlockService = {
       }
       
       // Extract blocked user IDs and block info
-      const blockedUserIds = [];
-      const blockInfo = {};
+      const blockedUsers = blockedSnapshot.docs.map(doc => ({
+        blockedUserId: doc.data().blockedUserId,
+        reason: doc.data().reason,
+        timestamp: doc.data().timestamp?.toDate() || new Date()
+      }));
       
-      blockedSnapshot.docs.forEach(doc => {
-        const data = doc.data();
-        blockedUserIds.push(data.blockedUserId);
-        blockInfo[data.blockedUserId] = {
-          reason: data.reason || '',
-          timestamp: data.timestamp?.toDate() || null
-        };
-      });
+      // Batch fetch user details for blocked users
+      const blockedUserIds = blockedUsers.map(item => item.blockedUserId);
       
-      // Get user details in batches (Firestore limits "in" queries to 10 items)
-      const userDetails = [];
+      // Split into batches of 10 (Firestore limit for 'in' queries)
+      const userDetailPromises = [];
       for (let i = 0; i < blockedUserIds.length; i += 10) {
         const batch = blockedUserIds.slice(i, i + 10);
-        const usersSnapshot = await firestore()
-          .collection('users')
-          .where(firestore.FieldPath.documentId(), 'in', batch)
-          .get();
-        
-        usersSnapshot.docs.forEach(doc => {
-          userDetails.push({
-            id: doc.id,
-            ...doc.data(),
-            blockInfo: blockInfo[doc.id]
-          });
+        userDetailPromises.push(
+          firestore()
+            .collection('users')
+            .where('id', 'in', batch)
+            .get()
+        );
+      }
+      
+      const userDetailSnapshots = await Promise.all(userDetailPromises);
+      
+      // Create a map of user details
+      const userDetailsMap = {};
+      userDetailSnapshots.forEach(snapshot => {
+        snapshot.docs.forEach(doc => {
+          userDetailsMap[doc.id] = doc.data();
         });
-      }
-      
-      return userDetails;
-    } catch (error) {
-      console.error('Get blocked users error:', error);
-      throw error;
-    }
-  }
-};
-
-/**
- * Post Service
- * Handles post operations
- */
-export const PostService = {
-  /**
-   * Create a new post
-   * 
-   * @param {Object} postData - Post data
-   * @returns {Promise<string>} Post ID
-   */
-  createPost: async (postData) => {
-    try {
-      const postRef = await firestore().collection('posts').add({
-        ...postData,
-        timestamp: firestore.FieldValue.serverTimestamp(),
-        likeCount: 0,
-        commentCount: 0,
-        likes: []
       });
       
-      return postRef.id;
-    } catch (error) {
-      console.error('Create post error:', error);
-      throw error;
-    }
-  },
-
-  /**
-   * Get post by ID
-   * 
-   * @param {string} postId - Post ID
-   * @returns {Promise<Object>} Post data
-   */
-  getPostById: async (postId) => {
-    try {
-      const postDoc = await firestore().collection('posts').doc(postId).get();
-      
-      if (!postDoc.exists) {
-        throw new Error('Post not found');
-      }
-      
-      return {
-        id: postDoc.id,
-        ...postDoc.data(),
-        timestamp: postDoc.data().timestamp?.toDate() || null
-      };
-    } catch (error) {
-      console.error('Get post error:', error);
-      throw error;
-    }
-  },
-
-  /**
-   * Update a post
-   * 
-   * @param {string} postId - Post ID
-   * @param {Object} data - Post data to update
-   * @returns {Promise<void>}
-   */
-  updatePost: async (postId, data) => {
-    try {
-      return await firestore().collection('posts').doc(postId).update(data);
-    } catch (error) {
-      console.error('Update post error:', error);
-      throw error;
-    }
-  },
-
-  /**
-   * Delete a post
-   * 
-   * @param {string} postId - Post ID
-   * @returns {Promise<void>}
-   */
-  deletePost: async (postId) => {
-    try {
-      // Get post to check for media content
-      const postDoc = await firestore().collection('posts').doc(postId).get();
-      const postData = postDoc.data();
-      
-      // Delete post document
-      await firestore().collection('posts').doc(postId).delete();
-      
-      // Delete associated comments
-      const commentsSnapshot = await firestore()
-        .collection('comments')
-        .where('postId', '==', postId)
-        .get();
-        
-      const batch = firestore().batch();
-      commentsSnapshot.docs.forEach(doc => {
-        batch.delete(doc.ref);
-      });
-      
-      if (commentsSnapshot.docs.length > 0) {
-        await batch.commit();
-      }
-      
-      // Delete media if exists
-      if (postData && postData.content && 
-          (postData.type === 'image' || postData.type === 'video')) {
-        try {
-          const fileRef = storage().refFromURL(postData.content);
-          await fileRef.delete();
-        } catch (storageError) {
-          console.error('Error deleting media:', storageError);
-          // Continue even if media deletion fails
-        }
-      }
-      
-      return true;
-    } catch (error) {
-      console.error('Delete post error:', error);
-      throw error;
-    }
-  },
-
-  /**
-   * Get feed posts
-   * 
-   * @param {string} userId - User ID
-   * @param {Array} blockedUsers - List of blocked user IDs
-   * @param {number} limit - Maximum number of posts
-   * @param {Object} lastDoc - Last document for pagination
-   * @returns {Promise<Array>} Feed posts
-   */
-  getFeedPosts: async (userId, blockedUsers = [], limit = 10, lastDoc = null) => {
-    try {
-      // Get user's connections
-      const connectionsSnapshot = await firestore()
-        .collection('connections')
-        .where('userId', '==', userId)
-        .get();
-      
-      const connectedUserIds = connectionsSnapshot.docs.map(doc => doc.data().connectedUserId);
-      
-      // Include user's own posts
-      const allUserIds = [...connectedUserIds, userId];
-      
-      // Filter out blocked users
-      const filteredUserIds = allUserIds.filter(id => !blockedUsers.includes(id));
-      
-      // Create query
-      let query = firestore().collection('posts');
-      
-      // Firestore 'in' operator can only take up to 10 values
-      if (filteredUserIds.length <= 10) {
-        query = query.where('userId', 'in', filteredUserIds.length > 0 ? filteredUserIds : [userId]);
-      } else {
-        // For more than 10 users, we need a different approach
-        // This is a simplified approach using only the user's posts
-        query = query.where('userId', '==', userId);
-      }
-      
-      // Add ordering
-      query = query.orderBy('timestamp', 'desc');
-      
-      // Add pagination
-      if (lastDoc) {
-        query = query.startAfter(lastDoc);
-      }
-      
-      // Add limit
-      query = query.limit(limit);
-      
-      // Execute query
-      const postsSnapshot = await query.get();
-      
-      return {
-        posts: postsSnapshot.docs.map(doc => ({
-          id: doc.id,
-          ...doc.data(),
-          timestamp: doc.data().timestamp?.toDate() || null
-        })),
-        lastDoc: postsSnapshot.docs.length > 0 
-          ? postsSnapshot.docs[postsSnapshot.docs.length - 1] 
-          : null
-      };
-    } catch (error) {
-      console.error('Get feed posts error:', error);
-      throw error;
-    }
-  },
-
-  /**
-   * Toggle like on a post
-   * 
-   * @param {string} postId - Post ID
-   * @param {string} userId - User ID
-   * @returns {Promise<boolean>} Whether the post is liked after toggle
-   */
-  toggleLike: async (postId, userId) => {
-    try {
-      const postRef = firestore().collection('posts').doc(postId);
-      
-      // Use transaction to ensure consistency
-      const result = await firestore().runTransaction(async transaction => {
-        const postDoc = await transaction.get(postRef);
-        
-        if (!postDoc.exists) {
-          throw new Error('Post does not exist');
-        }
-        
-        const postData = postDoc.data();
-        const likes = postData.likes || [];
-        const isLiked = likes.includes(userId);
-        
-        if (isLiked) {
-          // Unlike
-          transaction.update(postRef, {
-            likes: firestore.FieldValue.arrayRemove(userId),
-            likeCount: firestore.FieldValue.increment(-1)
-          });
-          return false;
-        } else {
-          // Like
-          transaction.update(postRef, {
-            likes: firestore.FieldValue.arrayUnion(userId),
-            likeCount: firestore.FieldValue.increment(1)
-          });
-          
-          // Create notification for post author if needed
-          if (postData.userId !== userId) {
-            // Get user data for notification
-            const userDoc = await transaction.get(
-              firestore().collection('users').doc(userId)
-            );
-            
-            if (userDoc.exists) {
-              const userData = userDoc.data();
-              const notificationRef = firestore().collection('notifications').doc();
-              
-              transaction.set(notificationRef, {
-                type: 'like',
-                senderId: userId,
-                senderName: `${userData.firstName} ${userData.lastName}`,
-                senderProfileImage: userData.profileImageURL,
-                recipientId: postData.userId,
-                postId: postId,
-                message: 'liked your post',
-                timestamp: firestore.FieldValue.serverTimestamp(),
-                read: false
-              });
-            }
+      // Combine block info with user details
+      return blockedUsers.map(blockInfo => {
+        const userDetails = userDetailsMap[blockInfo.blockedUserId] || {};
+        return {
+          id: blockInfo.blockedUserId,
+          ...userDetails,
+          blockInfo: {
+            reason: blockInfo.reason,
+            timestamp: blockInfo.timestamp
           }
-          
-          return true;
-        }
+        };
       });
-      
-      return result;
     } catch (error) {
-      console.error('Toggle like error:', error);
-      throw error;
-    }
-  }
-};
-
-/**
- * Comment Service
- * Handles comment operations
- */
-export const CommentService = {
-  /**
-   * Add a comment to a post
-   * 
-   * @param {Object} commentData - Comment data
-   * @returns {Promise<string>} Comment ID
-   */
-  addComment: async (commentData) => {
-    try {
-      // Add comment
-      const commentRef = await firestore().collection('comments').add({
-        ...commentData,
-        timestamp: firestore.FieldValue.serverTimestamp(),
-        edited: false
-      });
-      
-      // Update post comment count
-      await firestore()
-        .collection('posts')
-        .doc(commentData.postId)
-        .update({
-          commentCount: firestore.FieldValue.increment(1)
-        });
-      
-      // Create notification for post author if needed
-      if (commentData.userId !== commentData.postAuthorId) {
-        await firestore().collection('notifications').add({
-          type: 'comment',
-          senderId: commentData.userId,
-          senderName: commentData.userFullName,
-          senderProfileImage: commentData.userProfileImageURL,
-          recipientId: commentData.postAuthorId,
-          postId: commentData.postId,
-          message: 'commented on your post',
-          timestamp: firestore.FieldValue.serverTimestamp(),
-          read: false
-        });
-      }
-      
-      return commentRef.id;
-    } catch (error) {
-      console.error('Add comment error:', error);
+      console.error('Error getting blocked user details:', error);
       throw error;
     }
   },
-
+  
   /**
-   * Get comments for a post
-   * 
-   * @param {string} postId - Post ID
-   * @param {Array} blockedUsers - List of blocked user IDs
-   * @returns {Promise<Array>} Comments
-   */
-  getComments: async (postId, blockedUsers = []) => {
-    try {
-      const commentsSnapshot = await firestore()
-        .collection('comments')
-        .where('postId', '==', postId)
-        .orderBy('timestamp', 'asc')
-        .get();
-      
-      // Filter out comments from blocked users
-      return commentsSnapshot.docs
-        .filter(doc => !blockedUsers.includes(doc.data().userId))
-        .map(doc => ({
-          id: doc.id,
-          ...doc.data(),
-          timestamp: doc.data().timestamp?.toDate() || null,
-          editTimestamp: doc.data().editTimestamp?.toDate() || null
-        }));
-    } catch (error) {
-      console.error('Get comments error:', error);
-      throw error;
-    }
-  },
-
-  /**
-   * Update a comment
-   * 
-   * @param {string} commentId - Comment ID
-   * @param {string} text - Updated comment text
-   * @returns {Promise<void>}
-   */
-  updateComment: async (commentId, text) => {
-    try {
-      return await firestore().collection('comments').doc(commentId).update({
-        text,
-        edited: true,
-        editTimestamp: firestore.FieldValue.serverTimestamp()
-      });
-    } catch (error) {
-      console.error('Update comment error:', error);
-      throw error;
-    }
-  },
-
-  /**
-   * Delete a comment
-   * 
-   * @param {string} commentId - Comment ID
-   * @param {string} postId - Post ID
-   * @returns {Promise<void>}
-   */
-  deleteComment: async (commentId, postId) => {
-    try {
-      // Delete comment
-      await firestore().collection('comments').doc(commentId).delete();
-      
-      // Update post comment count
-      await firestore()
-        .collection('posts')
-        .doc(postId)
-        .update({
-          commentCount: firestore.FieldValue.increment(-1)
-        });
-      
-      return true;
-    } catch (error) {
-      console.error('Delete comment error:', error);
-      throw error;
-    }
-  }
-};
-
-/**
- * Connection Service
- * Handles user connections/following
- */
-export const ConnectionService = {
-  /**
-   * Follow a user
-   * 
+   * Block a user
    * @param {string} userId - Current user ID
-   * @param {string} followUserId - User ID to follow
-   * @returns {Promise<void>}
+   * @param {string} blockedUserId - User ID to block
+   * @param {string} reason - Reason for blocking
+   * @returns {Promise<boolean>} Success status
    */
-  followUser: async (userId, followUserId) => {
+  blockUser: async (userId, blockedUserId, reason = '') => {
     try {
-      // Create connection
-      await firestore().collection('connections').add({
-        userId,
-        connectedUserId: followUserId,
-        timestamp: firestore.FieldValue.serverTimestamp()
-      });
-      
-      // Create notification
-      const userDoc = await firestore().collection('users').doc(userId).get();
-      const userData = userDoc.data();
-      
-      await firestore().collection('notifications').add({
-        type: 'follow',
-        senderId: userId,
-        senderName: `${userData.firstName} ${userData.lastName}`,
-        senderProfileImage: userData.profileImageURL,
-        recipientId: followUserId,
-        message: 'started following you',
-        timestamp: firestore.FieldValue.serverTimestamp(),
-        read: false
-      });
-      
-      return true;
-    } catch (error) {
-      console.error('Follow user error:', error);
-      throw error;
-    }
-  },
-
-  /**
-   * Unfollow a user
-   * 
-   * @param {string} userId - Current user ID
-   * @param {string} followUserId - User ID to unfollow
-   * @returns {Promise<void>}
-   */
-  unfollowUser: async (userId, followUserId) => {
-    try {
-      const connectionSnapshot = await firestore()
-        .collection('connections')
+      // Check if already blocked
+      const blockDoc = await firestore()
+        .collection('blocks')
         .where('userId', '==', userId)
-        .where('connectedUserId', '==', followUserId)
+        .where('blockedUserId', '==', blockedUserId)
+        .limit(1)
         .get();
       
-      if (connectionSnapshot.empty) {
-        return false;
-      }
-      
-      // Delete the connection
-      await connectionSnapshot.docs[0].ref.delete();
-      
-      return true;
-    } catch (error) {
-      console.error('Unfollow user error:', error);
-      throw error;
-    }
-  },
-
-  /**
-   * Check if user is following another user
-   * 
-   * @param {string} userId - Current user ID
-   * @param {string} followUserId - User ID to check
-   * @returns {Promise<boolean>} Whether the user is following
-   */
-  isFollowing: async (userId, followUserId) => {
-    try {
-      const connectionSnapshot = await firestore()
-        .collection('connections')
-        .where('userId', '==', userId)
-        .where('connectedUserId', '==', followUserId)
-        .get();
-      
-      return !connectionSnapshot.empty;
-    } catch (error) {
-      console.error('Is following error:', error);
-      throw error;
-    }
-  },
-
-  /**
-   * Get user's followers
-   * 
-   * @param {string} userId - User ID
-   * @returns {Promise<Array>} List of follower IDs
-   */
-  getFollowers: async (userId) => {
-    try {
-      const followersSnapshot = await firestore()
-        .collection('connections')
-        .where('connectedUserId', '==', userId)
-        .get();
-      
-      return followersSnapshot.docs.map(doc => doc.data().userId);
-    } catch (error) {
-      console.error('Get followers error:', error);
-      throw error;
-    }
-  },
-
-  /**
-   * Get users that a user is following
-   * 
-   * @param {string} userId - User ID
-   * @returns {Promise<Array>} List of followed user IDs
-   */
-  getFollowing: async (userId) => {
-    try {
-      const followingSnapshot = await firestore()
-        .collection('connections')
-        .where('userId', '==', userId)
-        .get();
-      
-      return followingSnapshot.docs.map(doc => doc.data().connectedUserId);
-    } catch (error) {
-      console.error('Get following error:', error);
-      throw error;
-    }
-  }
-};
-
-/**
- * Upload Service
- * Handles file uploads to Firebase Storage
- */
-export const UploadService = {
-  /**
-   * Upload an image to Firebase Storage
-   * 
-   * @param {string} uri - Local image URI
-   * @param {string} path - Storage path
-   * @param {Function} onProgress - Progress callback
-   * @returns {Promise<string>} Download URL
-   */
-  uploadImage: async (uri, path, onProgress = null) => {
-    try {
-      const reference = storage().ref(path);
-      
-      // Create upload task
-      const task = reference.putFile(uri);
-      
-      // Monitor progress if callback provided
-      if (onProgress) {
-        task.on('state_changed', snapshot => {
-          const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
-          onProgress(progress);
-        });
-      }
-      
-      // Wait for upload to complete
-      await task;
-      
-      // Get download URL
-      const url = await reference.getDownloadURL();
-      
-      return url;
-    } catch (error) {
-      console.error('Upload image error:', error);
-      throw error;
-    }
-  },
-
-  /**
-   * Upload a video to Firebase Storage
-   * 
-   * @param {string} uri - Local video URI
-   * @param {string} path - Storage path
-   * @param {Function} onProgress - Progress callback
-   * @returns {Promise<string>} Download URL
-   */
-  uploadVideo: async (uri, path, onProgress = null) => {
-    try {
-      const reference = storage().ref(path);
-      
-      // Create upload task
-      const task = reference.putFile(uri);
-      
-      // Monitor progress if callback provided
-      if (onProgress) {
-        task.on('state_changed', snapshot => {
-          const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
-          onProgress(progress);
-        });
-      }
-      
-      // Wait for upload to complete
-      await task;
-      
-      // Get download URL
-      const url = await reference.getDownloadURL();
-      
-      return url;
-    } catch (error) {
-      console.error('Upload video error:', error);
-      throw error;
-    }
-  },
-
-  /**
-   * Delete a file from Firebase Storage
-   * 
-   * @param {string} url - File download URL
-   * @returns {Promise<void>}
-   */
-  deleteFile: async (url) => {
-    try {
-      const reference = storage().refFromURL(url);
-      await reference.delete();
-      return true;
-    } catch (error) {
-      console.error('Delete file error:', error);
-      throw error;
-    }
-  }
-};
-
-/**
- * Notification Service
- * Handles user notifications
- */
-export const NotificationService = {
-  /**
-   * Get notifications for a user
-   * 
-   * @param {string} userId - User ID
-   * @param {Array} blockedUsers - List of blocked user IDs
-   * @param {number} limit - Maximum number of notifications
-   * @param {Object} lastDoc - Last document for pagination
-   * @returns {Promise<Array>} User notifications
-   */
-  getNotifications: async (userId, blockedUsers = [], limit = 20, lastDoc = null) => {
-    try {
-      // Create query
-      let query = firestore()
-        .collection('notifications')
-        .where('recipientId', '==', userId)
-        .orderBy('timestamp', 'desc');
-      
-      // Add pagination
-      if (lastDoc) {
-        query = query.startAfter(lastDoc);
-      }
-      
-      // Add limit
-      query = query.limit(limit);
-      
-      // Execute query
-      const snapshot = await query.get();
-      
-      // Filter out notifications from blocked users
-      return {
-        notifications: snapshot.docs
-          .filter(doc => !blockedUsers.includes(doc.data().senderId))
-          .map(doc => ({
-            id: doc.id,
-            ...doc.data(),
-            timestamp: doc.data().timestamp?.toDate() || null
-          })),
-        lastDoc: snapshot.docs.length > 0 
-          ? snapshot.docs[snapshot.docs.length - 1] 
-          : null
-      };
-    } catch (error) {
-      console.error('Get notifications error:', error);
-      throw error;
-    }
-  },
-
-  /**
-   * Mark notifications as read
-   * 
-   * @param {Array} notificationIds - Notification IDs
-   * @returns {Promise<void>}
-   */
-  markAsRead: async (notificationIds) => {
-    try {
-      if (!notificationIds || notificationIds.length === 0) {
-        return;
-      }
-      
-      // Use batch for multiple updates
-      const batch = firestore().batch();
-      
-      notificationIds.forEach(id => {
-        const docRef = firestore().collection('notifications').doc(id);
-        batch.update(docRef, { read: true });
-      });
-      
-      await batch.commit();
-      return true;
-    } catch (error) {
-      console.error('Mark notifications as read error:', error);
-      throw error;
-    }
-  },
-
-  /**
-   * Mark all notifications as read for a user
-   * 
-   * @param {string} userId - User ID
-   * @returns {Promise<void>}
-   */
-  markAllAsRead: async (userId) => {
-    try {
-      // Find all unread notifications
-      const snapshot = await firestore()
-        .collection('notifications')
-        .where('recipientId', '==', userId)
-        .where('read', '==', false)
-        .get();
-      
-      if (snapshot.empty) {
+      if (!blockDoc.empty) {
+        // Already blocked
         return true;
       }
       
-      // Use batch for multiple updates
-      const batch = firestore().batch();
-      
-      snapshot.docs.forEach(doc => {
-        batch.update(doc.ref, { read: true });
+      // Add to blocks collection
+      await firestore().collection('blocks').add({
+        userId,
+        blockedUserId,
+        reason,
+        timestamp: firestore.FieldValue.serverTimestamp()
       });
       
-      await batch.commit();
+      // Remove any connections between the users
+      const connectionsQuery = await firestore()
+        .collection('connections')
+        .where('userId', 'in', [userId, blockedUserId])
+        .where('connectedUserId', 'in', [userId, blockedUserId])
+        .get();
+      
+      // Use batch write for better performance
+      if (!connectionsQuery.empty) {
+        const batch = firestore().batch();
+        connectionsQuery.docs.forEach(doc => {
+          batch.delete(doc.ref);
+        });
+        await batch.commit();
+      }
+      
       return true;
     } catch (error) {
-      console.error('Mark all notifications as read error:', error);
+      console.error('Error blocking user:', error);
       throw error;
     }
   },
-
+  
   /**
-   * Delete a notification
-   * 
-   * @param {string} notificationId - Notification ID
-   * @returns {Promise<void>}
+   * Unblock a user
+   * @param {string} userId - Current user ID
+   * @param {string} blockedUserId - User ID to unblock
+   * @returns {Promise<boolean>} Success status
    */
-  deleteNotification: async (notificationId) => {
+  unblockUser: async (userId, blockedUserId) => {
     try {
-      await firestore().collection('notifications').doc(notificationId).delete();
+      const blockQuery = await firestore()
+        .collection('blocks')
+        .where('userId', '==', userId)
+        .where('blockedUserId', '==', blockedUserId)
+        .limit(1)
+        .get();
+      
+      if (blockQuery.empty) {
+        // Not blocked
+        return true;
+      }
+      
+      // Delete block document
+      await blockQuery.docs[0].ref.delete();
+      
       return true;
     } catch (error) {
-      console.error('Delete notification error:', error);
+      console.error('Error unblocking user:', error);
       throw error;
     }
   }
 };
 
-// Export a unified interface to all Firebase services
-export default {
-  AuthService,
-  UserService,
-  BlockService,
-  PostService,
-  CommentService,
-  ConnectionService,
-  UploadService,
-  NotificationService
+/**
+ * Content moderation service
+ */
+export const ContentModerationService = {
+  /**
+   * Submit a report for content moderation
+   * @param {Object} reportData - Report data
+   * @returns {Promise<string>} Report ID
+   */
+  submitReport: async (reportData) => {
+    try {
+      const enhancedReportData = {
+        ...reportData,
+        timestamp: firestore.FieldValue.serverTimestamp(),
+        status: 'pending',
+        reviewed: false
+      };
+      
+      const docRef = await firestore().collection('reports').add(enhancedReportData);
+      return docRef.id;
+    } catch (error) {
+      console.error('Error submitting report:', error);
+      throw error;
+    }
+  },
+  
+  /**
+   * Moderate reported content
+   * @param {string} reportId - Report ID
+   * @param {Object} decision - Moderation decision
+   * @returns {Promise<boolean>} Success status
+   */
+  moderateContent: async (reportId, decision) => {
+    try {
+      // Get the report
+      const reportRef = firestore().collection('reports').doc(reportId);
+      const reportDoc = await reportRef.get();
+      
+      if (!reportDoc.exists) {
+        throw new Error('Report not found');
+      }
+      
+      const reportData = reportDoc.data();
+      
+      // Update the report with the decision
+      await reportRef.update({
+        status: decision.decision,
+        moderatorId: decision.moderatorId,
+        moderatorNotes: decision.notes,
+        reason: decision.reason,
+        reviewTimestamp: firestore.FieldValue.serverTimestamp(),
+        reviewed: true
+      });
+      
+      // Handle content removal if needed
+      if (decision.decision === 'remove') {
+        const { type, contentId } = reportData;
+        
+        if (type === 'post') {
+          // Delete the post
+          await PostService.deletePost(contentId);
+        } else if (type === 'comment') {
+          // Delete the comment
+          await firestore().collection('comments').doc(contentId).delete();
+          
+          // Decrement comment count on the post
+          if (reportData.postId) {
+            await firestore().collection('posts').doc(reportData.postId).update({
+              commentCount: firestore.FieldValue.increment(-1)
+            });
+          }
+        } else if (type === 'user') {
+          // For user reports, we don't delete the user, but we could add them to a restricted list
+          await firestore().collection('restrictedUsers').add({
+            userId: contentId,
+            reason: decision.reason,
+            timestamp: firestore.FieldValue.serverTimestamp(),
+            moderatorId: decision.moderatorId
+          });
+        }
+      }
+      
+      return true;
+    } catch (error) {
+      console.error('Error moderating content:', error);
+      throw error;
+    }
+  }
 };
