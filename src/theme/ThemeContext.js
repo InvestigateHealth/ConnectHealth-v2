@@ -1,85 +1,81 @@
 // src/theme/ThemeContext.js
-// Theme provider with light and dark mode support
+// Context for managing app theme
 
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useState, useContext, useEffect } from 'react';
 import { useColorScheme } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { lightTheme, darkTheme } from './theme';
+import { lightTheme, darkTheme } from './themes';
 
-// Create context
-const ThemeContext = createContext();
-
-// Theme modes
+// Theme mode constants
 export const ThemeMode = {
   LIGHT: 'light',
   DARK: 'dark',
-  SYSTEM: 'system'
+  SYSTEM: 'system',
 };
 
-/**
- * Theme provider component
- */
-export const ThemeProvider = ({ children }) => {
-  // State to track the user's theme preference
-  const [themeMode, setThemeMode] = useState(ThemeMode.SYSTEM);
-  // State to track whether dark mode is active
-  const [isDarkMode, setIsDarkMode] = useState(false);
-  // Get the system color scheme
-  const colorScheme = useColorScheme();
+// Create the theme context
+const ThemeContext = createContext({
+  theme: lightTheme,
+  themeMode: ThemeMode.SYSTEM,
+  isDarkMode: false,
+  changeThemeMode: () => {},
+});
 
-  // Load saved theme preference on mount
+// Theme provider component
+export const ThemeProvider = ({ children }) => {
+  const systemColorScheme = useColorScheme();
+  const [themeMode, setThemeMode] = useState(ThemeMode.SYSTEM);
+  const [theme, setTheme] = useState(lightTheme);
+  const [isDarkMode, setIsDarkMode] = useState(false);
+
+  // Load saved theme mode on mount
   useEffect(() => {
-    const loadThemePreference = async () => {
+    const loadSavedThemeMode = async () => {
       try {
         const savedThemeMode = await AsyncStorage.getItem('themeMode');
         if (savedThemeMode) {
           setThemeMode(savedThemeMode);
         }
       } catch (error) {
-        console.error('Error loading theme preference:', error);
+        console.error('Error loading saved theme mode:', error);
       }
     };
-    
-    loadThemePreference();
+
+    loadSavedThemeMode();
   }, []);
 
-  // Update dark mode based on theme mode and system setting
+  // Update theme when theme mode or system preference changes
   useEffect(() => {
+    let newIsDarkMode = false;
+
     if (themeMode === ThemeMode.SYSTEM) {
-      setIsDarkMode(colorScheme === 'dark');
+      newIsDarkMode = systemColorScheme === 'dark';
     } else {
-      setIsDarkMode(themeMode === ThemeMode.DARK);
+      newIsDarkMode = themeMode === ThemeMode.DARK;
     }
-  }, [themeMode, colorScheme]);
 
-  // Get the current theme object
-  const theme = isDarkMode ? darkTheme : lightTheme;
+    setIsDarkMode(newIsDarkMode);
+    setTheme(newIsDarkMode ? darkTheme : lightTheme);
+  }, [themeMode, systemColorScheme]);
 
-  // Save theme preference
-  const saveThemePreference = async (mode) => {
+  // Function to change theme mode
+  const changeThemeMode = async (newThemeMode) => {
+    setThemeMode(newThemeMode);
+    
+    // Save to storage
     try {
-      await AsyncStorage.setItem('themeMode', mode);
+      await AsyncStorage.setItem('themeMode', newThemeMode);
     } catch (error) {
-      console.error('Error saving theme preference:', error);
+      console.error('Error saving theme mode:', error);
     }
   };
 
-  /**
-   * Change theme mode
-   * 
-   * @param {string} mode - Theme mode to set
-   */
-  const changeThemeMode = (mode) => {
-    setThemeMode(mode);
-    saveThemePreference(mode);
-  };
-
-  // Value provided to consumers
+  // Context value
   const value = {
     theme,
-    isDarkMode,
     themeMode,
-    changeThemeMode
+    isDarkMode,
+    changeThemeMode,
   };
 
   return (
@@ -89,12 +85,10 @@ export const ThemeProvider = ({ children }) => {
   );
 };
 
-/**
- * Hook to access theme context
- */
+// Hook for using the theme context
 export const useTheme = () => {
   const context = useContext(ThemeContext);
-  if (!context) {
+  if (context === undefined) {
     throw new Error('useTheme must be used within a ThemeProvider');
   }
   return context;
