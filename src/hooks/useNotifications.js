@@ -1,147 +1,344 @@
 // src/hooks/useNotifications.js
-// Hook for working with notifications
+// Custom hook for handling notifications
 
-import { useEffect, useState } from 'react';
-import { useSelector, useDispatch } from 'react-redux';
-import { 
-  fetchNotifications, 
-  markAsRead, 
-  markAllAsRead 
-} from '../redux/slices/notificationsSlice';
-import { PushNotifications } from '../services/NotificationService';
-import { useUser } from './useUser';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import firestore from '@react-native-firebase/firestore';
+import messaging from '@react-native-firebase/messaging';
+import PushNotification from 'react-native-push-notification';
+import PushNotificationIOS from '@react-native-community/push-notification-ios';
+import { Platform, AppState } from 'react-native';
+import { useUser } from '../contexts/UserContext';
 
-/**
- * Hook for working with notifications
- */
 export const useNotifications = () => {
-  const dispatch = useDispatch();
   const { user } = useUser();
-  const { 
-    notifications, 
-    unreadCount, 
-    status, 
-    error,
-    lastFetchedAt 
-  } = useSelector(state => state.notifications);
-  const [loading, setLoading] = useState(status === 'loading');
+  const [notifications, setNotifications] = useState([]);
+  const [unreadCount, setUnreadCount] = useState(0);
+  const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [permissionStatus, setPermissionStatus] = useState('undetermined');
   
-  // Update loading state when status changes
-  useEffect(() => {
-    setLoading(status === 'loading');
-  }, [status]);
+  const notificationsListener = useRef(null);
+  const appState = useRef(AppState.currentState);
   
-  // Fetch notifications if needed
+  // Initialize push notifications
   useEffect(() => {
-    if (user && (!lastFetchedAt || shouldRefresh(lastFetchedAt))) {
-      loadNotifications();
+    // Configure local notifications
+    PushNotification.configure({
+      // (required) Called when a remote is received or opened, or local notification is opened
+      onNotification: function (notification) {
+        // Process the notification
+        if (Platform.OS === 'ios') {
+          notification.finish(PushNotificationIOS.FetchResult.NoData);
+        }
+      },
+      
+      // Should the initial notification be popped automatically
+      popInitialNotification: true,
+      
+      // Request permissions for iOS
+      requestPermissions: Platform.OS === 'ios',
+      
+      // Permissions for Android
+      permissions: {
+        alert: true,
+        badge: true,
+        sound: true,
+      },
+    });
+    
+    // Create notification channel for Android
+    if (Platform.OS === 'android') {
+      PushNotification.createChannel(
+        {
+          channelId: 'health-connect-notifications',
+          channelName: 'HealthConnect Notifications',
+          channelDescription: 'Notifications from the HealthConnect app',
+          importance: 4, // High importance
+          vibrate: true,
+        },
+        (created) => console.log(`Notification channel created: ${created}`)
+      );
+    }
+    
+    // Check permission status
+    const checkPermissions = async () => {
+      try {
+        let status = 'undetermined';
+        if (Platform.OS === 'ios') {
+          const permission = await PushNotificationIOS.requestPermissions();
+          status = permission.alert ? 'granted' : 'denied';
+        } else {
+          const permission = await messaging().hasPermission();
+          status = permission === messaging.AuthorizationStatus.AUTHORIZED 
+            ? 'granted' 
+            : permission === messaging.AuthorizationStatus.DENIED
+              ? 'denied'
+              : 'undetermined';
+        }
+        setPermissionStatus(status);
+      } catch (error) {
+        console.error('Error checking notification permissions:', error);
+        setPermissionStatus('denied');
+      }
+    };
+    
+    checkPermissions();
+    
+    // Listen for app state changes to refresh notifications
+    const subscription = AppState.addEventListener('change', nextAppState => {
+      if (appState.current === 'background' && nextAppState === 'active') {
+        refreshNotifications();
+      }
+      appState.current = nextAppState;
+    });
+    
+    return () => {
+      subscription.remove();
+      
+      // Clean up notification listener
+      if (notificationsListener.current) {
+        notificationsListener.current();
+      }
+    };
+  }, []);
+  
+  // Fetch notifications when user changes
+  useEffect(() => {
+    if (user) {
+      fetchNotifications();
+    } else {
+      setNotifications([]);
+      setUnreadCount(0);
+      if (notificationsListener.current) {
+        notificationsListener.current();
+        notificationsListener.current = null;
+      }
+    }
+    
+    return () => {
+      if (notificationsListener.current) {
+        notificationsListener.current();
+        notificationsListener.current = null;
+      }
+    };
+  }, [user]);
+  
+  // Fetch notifications
+  const fetchNotifications = useCallback(async () => {
+    if (!user) return;
+    
+    try {
+      setLoading(true);
+      
+      // Clear previous listener if exists
+      if (notificationsListener.current) {
+        notificationsListener.current();
+        notificationsListener.current = null;
+      }
+      
+      // Set up real-time listener for notifications
+      notificationsListener.current = firestore()
+        .collection('notifications')
+        .where('recipientId', '==', user.uid)
+        .orderBy('timestamp', 'desc')
+        .limit(50)
+        .onSnapshot(snapshot => {
+          // Process snapshot
+          const notificationData = snapshot.docs.map(doc => ({
+            id: doc.id,
+            ...doc.data(),
+            timestamp: doc.data().timestamp?.toDate() || new Date()
+          }));
+          
+          // Update state
+          setNotifications(notificationData);
+          
+          // Count unread notifications
+          const unread = notificationData.filter(n => !n.read).length;
+          setUnreadCount(unread);
+          
+          // Update badge count on iOS
+          if (Platform.OS === 'ios') {
+            PushNotificationIOS.setApplicationIconBadgeNumber(unread);
+          }
+          
+          setLoading(false);
+          setRefreshing(false);
+        }, error => {
+          console.error('Error in notifications listener:', error);
+          setLoading(false);
+          setRefreshing(false);
+        });
+      
+    } catch (error) {
+      console.error('Error fetching notifications:', error);
+      setLoading(false);
+      setRefreshing(false);
     }
   }, [user]);
   
-  // Check if we should refresh based on last fetch time
-  const shouldRefresh = (lastFetch) => {
-    if (!lastFetch) return true;
-    
-    const lastFetchTime = new Date(lastFetch).getTime();
-    const now = new Date().getTime();
-    const fifteenMinutes = 15 * 60 * 1000;
-    
-    return now - lastFetchTime > fifteenMinutes;
-  };
-  
-  // Load notifications
-  const loadNotifications = async () => {
-    if (!user) return;
-    
-    try {
-      await dispatch(fetchNotifications({ userId: user.uid })).unwrap();
-    } catch (error) {
-      console.error('Error loading notifications:', error);
-    }
-  };
-  
-  // Load more notifications
-  const loadMoreNotifications = async () => {
-    if (!user || loading || notifications.length === 0) return;
-    
-    try {
-      const lastNotification = notifications[notifications.length - 1];
-      await dispatch(fetchNotifications({ 
-        userId: user.uid, 
-        lastDoc: lastNotification 
-      })).unwrap();
-    } catch (error) {
-      console.error('Error loading more notifications:', error);
-    }
-  };
-  
-  // Refresh notifications
-  const refreshNotifications = async () => {
-    if (!user) return;
-    
+  // Manual refresh for pull-to-refresh
+  const refreshNotifications = useCallback(() => {
     setRefreshing(true);
-    try {
-      await dispatch(fetchNotifications({ userId: user.uid })).unwrap();
-    } catch (error) {
-      console.error('Error refreshing notifications:', error);
-    } finally {
-      setRefreshing(false);
-    }
-  };
+    fetchNotifications();
+  }, [fetchNotifications]);
   
-  // Mark notification as read
-  const markNotificationAsRead = async (notificationId) => {
+  // Mark a notification as read
+  const markAsRead = useCallback(async (notificationId) => {
     if (!user) return;
     
     try {
-      await dispatch(markAsRead([notificationId])).unwrap();
+      await firestore()
+        .collection('notifications')
+        .doc(notificationId)
+        .update({
+          read: true
+        });
       
-      // Update badge count
-      if (unreadCount > 0) {
-        PushNotifications.setBadgeCount(unreadCount - 1);
+      // Update local state
+      setNotifications(prev => 
+        prev.map(n => 
+          n.id === notificationId ? { ...n, read: true } : n
+        )
+      );
+      
+      // Update unread count
+      setUnreadCount(prev => Math.max(0, prev - 1));
+      
+      // Update badge count on iOS
+      if (Platform.OS === 'ios') {
+        PushNotificationIOS.setApplicationIconBadgeNumber(Math.max(0, unreadCount - 1));
       }
+      
+      return true;
     } catch (error) {
       console.error('Error marking notification as read:', error);
+      return false;
     }
-  };
+  }, [user, unreadCount]);
   
   // Mark all notifications as read
-  const markAllNotificationsAsRead = async () => {
+  const markAllAsRead = useCallback(async () => {
     if (!user) return;
     
     try {
-      await dispatch(markAllAsRead(user.uid)).unwrap();
+      // Get all unread notifications
+      const unreadSnapshot = await firestore()
+        .collection('notifications')
+        .where('recipientId', '==', user.uid)
+        .where('read', '==', false)
+        .get();
       
-      // Reset badge count
-      PushNotifications.setBadgeCount(0);
+      if (unreadSnapshot.empty) return true;
+      
+      // Create batch to update all at once
+      const batch = firestore().batch();
+      unreadSnapshot.docs.forEach(doc => {
+        batch.update(doc.ref, { read: true });
+      });
+      
+      await batch.commit();
+      
+      // Update local state
+      setNotifications(prev => 
+        prev.map(n => ({ ...n, read: true }))
+      );
+      
+      // Update unread count
+      setUnreadCount(0);
+      
+      // Update badge count on iOS
+      if (Platform.OS === 'ios') {
+        PushNotificationIOS.setApplicationIconBadgeNumber(0);
+      }
+      
+      return true;
     } catch (error) {
       console.error('Error marking all notifications as read:', error);
-    }
-  };
-  
-  // Set up notification handling
-  const setupNotifications = async () => {
-    try {
-      return await PushNotifications.requestPermissions();
-    } catch (error) {
-      console.error('Error setting up notifications:', error);
       return false;
     }
-  };
+  }, [user]);
+  
+  // Delete a notification
+  const deleteNotification = useCallback(async (notificationId) => {
+    if (!user) return;
+    
+    try {
+      await firestore()
+        .collection('notifications')
+        .doc(notificationId)
+        .delete();
+      
+      // Update local state
+      setNotifications(prev => 
+        prev.filter(n => n.id !== notificationId)
+      );
+      
+      // Update unread count if necessary
+      const wasUnread = notifications.find(n => n.id === notificationId)?.read === false;
+      if (wasUnread) {
+        setUnreadCount(prev => Math.max(0, prev - 1));
+        
+        // Update badge count on iOS
+        if (Platform.OS === 'ios') {
+          PushNotificationIOS.setApplicationIconBadgeNumber(Math.max(0, unreadCount - 1));
+        }
+      }
+      
+      return true;
+    } catch (error) {
+      console.error('Error deleting notification:', error);
+      return false;
+    }
+  }, [user, notifications, unreadCount]);
+  
+  // Register FCM token with user profile for remote notifications
+  const registerPushToken = useCallback(async () => {
+    if (!user) return;
+    
+    try {
+      // Check permission first
+      let authStatus = await messaging().hasPermission();
+      
+      // Request permission if not determined
+      if (authStatus === messaging.AuthorizationStatus.NOT_DETERMINED) {
+        authStatus = await messaging().requestPermission();
+      }
+      
+      // If not authorized, update status and return
+      if (authStatus !== messaging.AuthorizationStatus.AUTHORIZED) {
+        setPermissionStatus('denied');
+        return;
+      }
+      
+      // Get token
+      const token = await messaging().getToken();
+      
+      // Save token to user's profile
+      await firestore()
+        .collection('users')
+        .doc(user.uid)
+        .update({
+          fcmTokens: firestore.FieldValue.arrayUnion(token)
+        });
+      
+      setPermissionStatus('granted');
+    } catch (error) {
+      console.error('Error registering push token:', error);
+    }
+  }, [user]);
   
   return {
     notifications,
     unreadCount,
     loading,
     refreshing,
-    error,
-    loadNotifications,
-    loadMoreNotifications,
+    permissionStatus,
     refreshNotifications,
-    markNotificationAsRead,
-    markAllNotificationsAsRead,
-    setupNotifications,
+    markAsRead,
+    markAllAsRead,
+    deleteNotification,
+    registerPushToken
   };
 };
 
