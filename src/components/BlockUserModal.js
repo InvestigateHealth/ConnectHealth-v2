@@ -1,160 +1,196 @@
 // src/components/BlockUserModal.js
-// Modal for blocking users with reason input - Updated with proper error handling and callback safety
+// Modal component for blocking users
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   View,
   Text,
   StyleSheet,
   Modal,
   TouchableOpacity,
-  TextInput,
   ActivityIndicator,
-  Alert,
-  SafeAreaView,
-  KeyboardAvoidingView,
-  Platform,
-  ScrollView
+  TouchableWithoutFeedback
 } from 'react-native';
 import Icon from 'react-native-vector-icons/Ionicons';
-import { useUser } from '../contexts/UserContext';
 import { useTheme } from '../theme/ThemeContext';
+import { useUser } from '../contexts/UserContext';
 
 const BlockUserModal = ({ visible, onClose, userToBlock, onSuccess }) => {
   const { theme } = useTheme();
-  const [reason, setReason] = useState('');
-  const [isBlocking, setIsBlocking] = useState(false);
-  const [error, setError] = useState(null);
   const { blockUser } = useUser();
-
-  const handleBlockUser = async () => {
-    if (!userToBlock?.id) {
-      setError('Invalid user information. Please try again.');
-      return;
+  
+  const [selectedReason, setSelectedReason] = useState('');
+  const [loading, setLoading] = useState(false);
+  
+  // Reset state when modal is opened/closed
+  useEffect(() => {
+    if (!visible) {
+      setSelectedReason('');
+      setLoading(false);
     }
-    
-    setIsBlocking(true);
-    setError(null);
+  }, [visible]);
+
+  // Available reasons for blocking
+  const blockReasons = [
+    'Harassment',
+    'Inappropriate Content',
+    'Spam',
+    'Unwanted Contact',
+    'Other'
+  ];
+
+  // Handle block user submission
+  const handleBlockUser = async () => {
+    if (!userToBlock?.id) return;
     
     try {
-      const success = await blockUser(userToBlock.id, reason);
+      setLoading(true);
+      
+      // Call blockUser function from UserContext
+      const success = await blockUser(userToBlock.id, selectedReason);
       
       if (success) {
-        // Safely call onSuccess if it was provided
-        if (typeof onSuccess === 'function') {
-          onSuccess();
-        }
-        handleCancel(); // Reset and close modal
+        onSuccess?.();
+        onClose();
       } else {
         throw new Error('Failed to block user');
       }
     } catch (error) {
       console.error('Error blocking user:', error);
-      setError('Failed to block user. Please try again later.');
+      // Handle error - in this case we'll just close the modal
+      // since error handling would be done in the context
+      onClose();
     } finally {
-      setIsBlocking(false);
+      setLoading(false);
     }
   };
 
-  const handleCancel = () => {
-    setReason('');
-    setError(null);
-    onClose();
+  // Get formatted user name
+  const getUserName = () => {
+    if (!userToBlock) return 'this user';
+    return `${userToBlock.firstName || ''} ${userToBlock.lastName || ''}`.trim() || 'this user';
   };
-
-  // Ensure userToBlock is valid
-  const userDisplayName = userToBlock ? 
-    `${userToBlock.name || 'this user'}` : 
-    'this user';
 
   return (
     <Modal
       visible={visible}
       transparent
       animationType="fade"
-      onRequestClose={handleCancel}
+      onRequestClose={onClose}
     >
-      <SafeAreaView style={styles.safeContainer}>
-        <KeyboardAvoidingView
-          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-          style={styles.container}
-        >
-          <TouchableOpacity 
-            style={styles.backdrop} 
-            activeOpacity={1} 
-            onPress={handleCancel}
-          />
-          <ScrollView contentContainerStyle={styles.scrollContainer}>
-            <View style={[styles.content, { backgroundColor: theme.colors.background.paper }]}>
+      <TouchableWithoutFeedback onPress={onClose}>
+        <View style={styles.overlay}>
+          <TouchableWithoutFeedback onPress={e => e.stopPropagation()}>
+            <View style={[
+              styles.container,
+              { backgroundColor: theme.colors.background.paper }
+            ]}>
               <View style={styles.header}>
-                <Icon name="shield-outline" size={24} color={theme.colors.error.main} />
-                <Text style={[styles.title, { color: theme.colors.text.primary }]}>Block User</Text>
-              </View>
-              
-              <Text style={[styles.description, { color: theme.colors.text.primary }]}>
-                When you block {userDisplayName}, they won't be able to:
-              </Text>
-              
-              <View style={styles.reasonsList}>
-                <View style={styles.reasonItem}>
-                  <Icon name="checkmark-circle" size={16} color={theme.colors.success.main} />
-                  <Text style={[styles.reasonText, { color: theme.colors.text.primary }]}>See your posts</Text>
-                </View>
-                <View style={styles.reasonItem}>
-                  <Icon name="checkmark-circle" size={16} color={theme.colors.success.main} />
-                  <Text style={[styles.reasonText, { color: theme.colors.text.primary }]}>Comment on your content</Text>
-                </View>
-                <View style={styles.reasonItem}>
-                  <Icon name="checkmark-circle" size={16} color={theme.colors.success.main} />
-                  <Text style={[styles.reasonText, { color: theme.colors.text.primary }]}>Send you messages</Text>
-                </View>
-                <View style={styles.reasonItem}>
-                  <Icon name="checkmark-circle" size={16} color={theme.colors.success.main} />
-                  <Text style={[styles.reasonText, { color: theme.colors.text.primary }]}>Follow your account</Text>
-                </View>
-              </View>
-              
-              <Text style={[styles.optional, { color: theme.colors.text.primary }]}>Reason for blocking (optional):</Text>
-              <TextInput
-                style={[
-                  styles.input,
-                  { 
-                    color: theme.colors.text.primary,
-                    backgroundColor: theme.colors.background.input,
-                    borderColor: error ? theme.colors.error.main : theme.colors.border
-                  }
-                ]}
-                value={reason}
-                onChangeText={setReason}
-                placeholder="Enter reason for blocking..."
-                placeholderTextColor={theme.colors.text.hint}
-                multiline
-                maxLength={500}
-                textAlignVertical="top"
-              />
-              
-              {error && (
-                <Text style={[styles.errorText, { color: theme.colors.error.main }]}>
-                  {error}
+                <Text style={[
+                  styles.title,
+                  { color: theme.colors.text.primary }
+                ]}>
+                  Block {getUserName()}?
                 </Text>
-              )}
+                <TouchableOpacity onPress={onClose} hitSlop={{ top: 15, right: 15, bottom: 15, left: 15 }}>
+                  <Icon name="close" size={24} color={theme.colors.text.secondary} />
+                </TouchableOpacity>
+              </View>
               
-              <Text style={[styles.note, { color: theme.colors.text.secondary }]}>
-                This information is for your reference only and will not be shared.
+              <Text style={[
+                styles.description,
+                { color: theme.colors.text.secondary }
+              ]}>
+                When you block someone:
               </Text>
               
-              <View style={styles.buttonContainer}>
+              <View style={styles.bulletPoints}>
+                <View style={styles.bulletPoint}>
+                  <Icon name="checkmark-circle" size={16} color={theme.colors.success.main} />
+                  <Text style={[
+                    styles.bulletText,
+                    { color: theme.colors.text.primary }
+                  ]}>
+                    They won't be able to follow you or view your posts
+                  </Text>
+                </View>
+                
+                <View style={styles.bulletPoint}>
+                  <Icon name="checkmark-circle" size={16} color={theme.colors.success.main} />
+                  <Text style={[
+                    styles.bulletText,
+                    { color: theme.colors.text.primary }
+                  ]}>
+                    Their comments on your posts will be hidden
+                  </Text>
+                </View>
+                
+                <View style={styles.bulletPoint}>
+                  <Icon name="checkmark-circle" size={16} color={theme.colors.success.main} />
+                  <Text style={[
+                    styles.bulletText,
+                    { color: theme.colors.text.primary }
+                  ]}>
+                    They won't be notified that you blocked them
+                  </Text>
+                </View>
+              </View>
+              
+              <Text style={[
+                styles.reasonTitle,
+                { color: theme.colors.text.primary }
+              ]}>
+                Reason for blocking (optional):
+              </Text>
+              
+              <View style={styles.reasonContainer}>
+                {blockReasons.map((reason) => (
+                  <TouchableOpacity
+                    key={reason}
+                    style={[
+                      styles.reasonOption,
+                      selectedReason === reason && [
+                        styles.selectedReason,
+                        { backgroundColor: theme.colors.primary.lightest }
+                      ],
+                      { borderColor: theme.colors.divider }
+                    ]}
+                    onPress={() => setSelectedReason(reason)}
+                  >
+                    <Text style={[
+                      styles.reasonText,
+                      selectedReason === reason && { 
+                        color: theme.colors.primary.main,
+                        fontWeight: 'bold' 
+                      },
+                      { color: theme.colors.text.primary }
+                    ]}>
+                      {reason}
+                    </Text>
+                    {selectedReason === reason && (
+                      <Icon 
+                        name="checkmark-circle" 
+                        size={18} 
+                        color={theme.colors.primary.main} 
+                        style={styles.checkIcon}
+                      />
+                    )}
+                  </TouchableOpacity>
+                ))}
+              </View>
+              
+              <View style={styles.footer}>
                 <TouchableOpacity
-                  style={styles.cancelButton}
-                  onPress={handleCancel}
-                  disabled={isBlocking}
-                  accessibilityRole="button"
-                  accessibilityLabel="Cancel"
-                  accessibilityHint="Cancels blocking this user"
+                  style={[
+                    styles.cancelButton,
+                    { borderColor: theme.colors.divider }
+                  ]}
+                  onPress={onClose}
+                  disabled={loading}
                 >
                   <Text style={[
                     styles.cancelButtonText,
-                    { color: theme.colors.text.secondary }
+                    { color: theme.colors.text.primary }
                   ]}>
                     Cancel
                   </Text>
@@ -166,53 +202,39 @@ const BlockUserModal = ({ visible, onClose, userToBlock, onSuccess }) => {
                     { backgroundColor: theme.colors.error.main }
                   ]}
                   onPress={handleBlockUser}
-                  disabled={isBlocking}
-                  accessibilityRole="button"
-                  accessibilityLabel="Block user"
-                  accessibilityHint={`Blocks ${userDisplayName} from interacting with you`}
+                  disabled={loading}
                 >
-                  {isBlocking ? (
+                  {loading ? (
                     <ActivityIndicator size="small" color="white" />
                   ) : (
-                    <Text style={styles.blockButtonText}>Block</Text>
+                    <>
+                      <Icon name="ban-outline" size={18} color="white" style={styles.blockIcon} />
+                      <Text style={styles.blockButtonText}>Block</Text>
+                    </>
                   )}
                 </TouchableOpacity>
               </View>
             </View>
-          </ScrollView>
-        </KeyboardAvoidingView>
-      </SafeAreaView>
+          </TouchableWithoutFeedback>
+        </View>
+      </TouchableWithoutFeedback>
     </Modal>
   );
 };
 
 const styles = StyleSheet.create({
-  safeContainer: {
-    flex: 1,
-  },
-  container: {
+  overlay: {
     flex: 1,
     backgroundColor: 'rgba(0, 0, 0, 0.5)',
     justifyContent: 'center',
     alignItems: 'center',
+    padding: 16,
   },
-  backdrop: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-  },
-  scrollContainer: {
-    flexGrow: 1,
-    justifyContent: 'center',
-    padding: 20,
-  },
-  content: {
-    borderRadius: 10,
-    padding: 20,
+  container: {
     width: '100%',
     maxWidth: 400,
+    borderRadius: 12,
+    padding: 20,
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.25,
@@ -221,79 +243,93 @@ const styles = StyleSheet.create({
   },
   header: {
     flexDirection: 'row',
+    justifyContent: 'space-between',
     alignItems: 'center',
     marginBottom: 16,
   },
   title: {
-    fontSize: 20,
+    fontSize: 18,
     fontWeight: 'bold',
-    marginLeft: 10,
   },
   description: {
+    fontSize: 14,
+    marginBottom: 16,
+    lineHeight: 20,
+  },
+  bulletPoints: {
+    marginBottom: 20,
+  },
+  bulletPoint: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    marginBottom: 10,
+  },
+  bulletText: {
+    fontSize: 14,
+    lineHeight: 20,
+    flex: 1,
+    marginLeft: 10,
+  },
+  reasonTitle: {
     fontSize: 16,
-    marginBottom: 16,
+    fontWeight: '500',
+    marginBottom: 12,
   },
-  reasonsList: {
-    marginBottom: 16,
+  reasonContainer: {
+    marginBottom: 20,
   },
-  reasonItem: {
+  reasonOption: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginBottom: 8,
-  },
-  reasonText: {
-    fontSize: 14,
-    marginLeft: 8,
-  },
-  optional: {
-    fontSize: 14,
-    fontWeight: 'bold',
-    marginBottom: 8,
-  },
-  input: {
+    justifyContent: 'space-between',
+    paddingVertical: 12,
+    paddingHorizontal: 16,
     borderWidth: 1,
     borderRadius: 8,
-    padding: 12,
-    fontSize: 16,
-    minHeight: 100,
-    textAlignVertical: 'top',
+    marginBottom: 8,
   },
-  errorText: {
-    fontSize: 14,
-    marginTop: 8,
-    marginBottom: 4,
+  selectedReason: {
+    borderColor: 'transparent',
   },
-  note: {
-    fontSize: 12,
-    fontStyle: 'italic',
-    marginTop: 8,
-    marginBottom: 16,
+  reasonText: {
+    fontSize: 15,
   },
-  buttonContainer: {
+  checkIcon: {
+    marginLeft: 8,
+  },
+  footer: {
     flexDirection: 'row',
-    justifyContent: 'flex-end',
+    justifyContent: 'space-between',
   },
   cancelButton: {
-    paddingVertical: 10,
-    paddingHorizontal: 16,
-    marginRight: 10,
+    flex: 1,
+    paddingVertical: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: 8,
   },
   cancelButtonText: {
     fontSize: 16,
     fontWeight: '500',
   },
   blockButton: {
-    paddingVertical: 10,
-    paddingHorizontal: 16,
+    flex: 1,
+    flexDirection: 'row',
+    paddingVertical: 12,
     borderRadius: 8,
     justifyContent: 'center',
     alignItems: 'center',
-    minWidth: 80,
+    marginLeft: 8,
   },
   blockButtonText: {
-    fontSize: 16,
     color: 'white',
+    fontSize: 16,
     fontWeight: 'bold',
+  },
+  blockIcon: {
+    marginRight: 8,
   },
 });
 
