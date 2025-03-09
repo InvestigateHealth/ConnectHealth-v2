@@ -1,5 +1,5 @@
 // src/screens/UserProfileScreen.js
-// Screen for viewing other users' profiles with blocking functionality
+// Complete production-ready profile screen for viewing other users
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
@@ -14,7 +14,9 @@ import {
   ActivityIndicator,
   Platform,
   Modal,
-  TextInput
+  TextInput,
+  Keyboard,
+  AccessibilityInfo
 } from 'react-native';
 import FastImage from 'react-native-fast-image';
 import firestore from '@react-native-firebase/firestore';
@@ -25,12 +27,16 @@ import { useUser } from '../contexts/UserContext';
 import { useTheme } from '../theme/ThemeContext';
 import { useNetInfo } from '@react-native-community/netinfo';
 import PostThumbnail from '../components/PostThumbnail';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import * as Haptics from '../utils/haptics';
+import { AnalyticsService } from '../services/AnalyticsService';
 
 const UserProfileScreen = ({ route, navigation }) => {
   const { userId } = route.params;
   const { theme } = useTheme();
   const { user, userData: currentUserData, isUserBlocked, blockUser, unblockUser } = useUser();
   const { isConnected } = useNetInfo();
+  const insets = useSafeAreaInsets();
   
   const [userData, setUserData] = useState(null);
   const [posts, setPosts] = useState([]);
@@ -49,13 +55,19 @@ const UserProfileScreen = ({ route, navigation }) => {
   const [blockReason, setBlockReason] = useState('');
   const [userIsBlocked, setUserIsBlocked] = useState(false);
   const [error, setError] = useState(null);
+  const [customBlockReason, setCustomBlockReason] = useState('');
+  const [refreshing, setRefreshing] = useState(false);
   
   const isMounted = useRef(true);
   const postsListener = useRef(null);
   const connectionListener = useRef(null);
+  const flatListRef = useRef();
 
   // Set isMounted flag for preventing state updates after unmount
   useEffect(() => {
+    // Log screen view for analytics
+    AnalyticsService.logScreenView('UserProfile', { userId });
+    
     return () => {
       isMounted.current = false;
       if (postsListener.current) {
@@ -97,6 +109,14 @@ const UserProfileScreen = ({ route, navigation }) => {
     };
   }, [userId, activeTab, userIsBlocked]);
 
+  // Update navigation title when user data is loaded
+  useEffect(() => {
+    if (userData) {
+      const displayName = `${userData.firstName || ''} ${userData.lastName || ''}`.trim();
+      navigation.setOptions({ title: displayName || 'Profile' });
+    }
+  }, [userData, navigation]);
+
   // Fetch user data
   const fetchUserData = async () => {
     if (!userId) return;
@@ -105,6 +125,14 @@ const UserProfileScreen = ({ route, navigation }) => {
       setLoading(true);
       setError(null);
       
+      // Try to get from cache first
+      const cachedData = await getCachedUserData();
+      if (cachedData && isMounted.current) {
+        setUserData(cachedData);
+        setLoading(false);
+      }
+      
+      // Fetch from Firestore
       const userDoc = await firestore()
         .collection('users')
         .doc(userId)
@@ -112,18 +140,17 @@ const UserProfileScreen = ({ route, navigation }) => {
       
       if (userDoc.exists && isMounted.current) {
         const data = userDoc.data();
-        setUserData({
+        const userData = {
           id: userDoc.id,
           ...data,
           joinDate: data.joinDate ? data.joinDate.toDate() : new Date()
-        });
+        };
         
-        // Update navigation title if not already set
-        if (route.params?.title === 'User Profile') {
-          navigation.setOptions({
-            title: `${data.firstName || ''} ${data.lastName || ''}`.trim() || 'User Profile'
-          });
-        }
+        // Update state with fresh data
+        setUserData(userData);
+        
+        // Cache the user data
+        cacheUserData(userData);
       } else if (isMounted.current) {
         setError('User not found. This profile may have been deleted.');
       }
@@ -135,7 +162,42 @@ const UserProfileScreen = ({ route, navigation }) => {
     } finally {
       if (isMounted.current) {
         setLoading(false);
+        setRefreshing(false);
       }
+    }
+  };
+
+  // Cache user data for offline access
+  const cacheUserData = async (data) => {
+    try {
+      await AsyncStorage.setItem(
+        `user_profile_${userId}`,
+        JSON.stringify({
+          data,
+          timestamp: Date.now()
+        })
+      );
+    } catch (error) {
+      console.error('Error caching user data:', error);
+    }
+  };
+
+  // Get cached user data
+  const getCachedUserData = async () => {
+    try {
+      const cachedData = await AsyncStorage.getItem(`user_profile_${userId}`);
+      if (cachedData) {
+        const { data, timestamp } = JSON.parse(cachedData);
+        
+        // Check if cache is less than 1 hour old
+        if (Date.now() - timestamp < 60 * 60 * 1000) {
+          return data;
+        }
+      }
+      return null;
+    } catch (error) {
+      console.error('Error getting cached user data:', error);
+      return null;
     }
   };
 
@@ -252,6 +314,7 @@ const UserProfileScreen = ({ route, navigation }) => {
     
     try {
       setFollowLoading(true);
+      Haptics.impactMedium();
       
       if (isFollowing) {
         // Unfollow the user
@@ -285,6 +348,12 @@ const UserProfileScreen = ({ route, navigation }) => {
               followersCount: Math.max(0, prev.followersCount - 1)
             }));
           }
+          
+          // Log analytics event
+          AnalyticsService.logEvent('unfollow_user', { 
+            userId: userId,
+            currentUserId: user.uid
+          });
         }
       } else {
         // Follow the user
@@ -313,6 +382,12 @@ const UserProfileScreen = ({ route, navigation }) => {
             followersCount: prev.followersCount + 1
           }));
         }
+        
+        // Log analytics event
+        AnalyticsService.logEvent('follow_user', { 
+          userId: userId,
+          currentUserId: user.uid
+        });
       }
     } catch (error) {
       console.error('Error toggling follow status:', error);
@@ -324,20 +399,43 @@ const UserProfileScreen = ({ route, navigation }) => {
     }
   };
 
+  // Handle refresh
+  const handleRefresh = () => {
+    if (!isConnected) {
+      Alert.alert('Offline', 'Cannot refresh while offline.');
+      return;
+    }
+    
+    setRefreshing(true);
+    fetchUserData();
+    fetchUserStats();
+    checkFollowStatus();
+  };
+
   // Share user profile
   const handleShareProfile = async () => {
     if (!userData) return;
     
     try {
+      Haptics.impactLight();
+      
       // Generate a dynamic link or a deep link to the user's profile
       const profileUrl = `healthconnect://user/${userId}`;
       const userName = `${userData.firstName || ''} ${userData.lastName || ''}`.trim();
       
-      await Share.share({
+      const result = await Share.share({
         message: `Connect with ${userName} on HealthConnect: ${profileUrl}`,
         url: Platform.OS === 'ios' ? profileUrl : undefined,
         title: 'Connect on HealthConnect'
       });
+      
+      if (result.action === Share.sharedAction) {
+        // Log analytics event
+        AnalyticsService.logEvent('share_profile', { 
+          userId: userId,
+          currentUserId: user.uid
+        });
+      }
     } catch (error) {
       console.error('Error sharing profile:', error);
       Alert.alert('Error', 'Failed to share profile. Please try again.');
@@ -370,6 +468,12 @@ const UserProfileScreen = ({ route, navigation }) => {
                   Alert.alert('Success', `${userName} has been unblocked.`);
                   // Refresh posts after unblocking
                   fetchUserPosts();
+                  
+                  // Log analytics event
+                  AnalyticsService.logEvent('unblock_user', { 
+                    userId: userId,
+                    currentUserId: user.uid
+                  });
                 } else {
                   throw new Error('Failed to unblock user');
                 }
@@ -390,7 +494,11 @@ const UserProfileScreen = ({ route, navigation }) => {
   // Submit block with reason
   const handleSubmitBlock = async () => {
     try {
-      const success = await blockUser(userId, blockReason);
+      const finalReason = blockReason === 'Other' && customBlockReason 
+        ? customBlockReason 
+        : blockReason;
+      
+      const success = await blockUser(userId, finalReason);
       
       if (success) {
         setUserIsBlocked(true);
@@ -420,6 +528,13 @@ const UserProfileScreen = ({ route, navigation }) => {
         
         // Clear posts when blocked
         setPosts([]);
+        
+        // Log analytics event
+        AnalyticsService.logEvent('block_user', { 
+          userId: userId,
+          currentUserId: user.uid,
+          reason: finalReason
+        });
       } else {
         throw new Error('Failed to block user');
       }
@@ -449,6 +564,7 @@ const UserProfileScreen = ({ route, navigation }) => {
         reportedUserId: userId,
         reportedBy: auth().currentUser.uid,
         reason: reason,
+        additionalInfo: '', // Optional field for more details
         timestamp: firestore.FieldValue.serverTimestamp(),
         status: 'pending',
         reviewed: false
@@ -459,6 +575,13 @@ const UserProfileScreen = ({ route, navigation }) => {
         'Report Submitted',
         'Thank you for your report. We will review this user.'
       );
+      
+      // Log analytics event
+      AnalyticsService.logEvent('report_user', { 
+        userId: userId,
+        currentUserId: user.uid,
+        reason: reason
+      });
     } catch (error) {
       console.error('Error submitting report:', error);
       Alert.alert('Error', 'Failed to submit report. Please try again.');
@@ -478,20 +601,58 @@ const UserProfileScreen = ({ route, navigation }) => {
   };
   
   // Render post item
-  const renderPostItem = useCallback(({ item }) => (
+  const renderPostItem = useCallback(({ item, index }) => (
     <PostThumbnail 
       post={item} 
       onPress={() => navigation.navigate('PostDetail', { 
         postId: item.id,
         title: 'Post Details'
       })}
+      testID={`post-thumbnail-${index}`}
+      accessibilityLabel={`Post from ${item.userFullName}, posted on ${format(item.timestamp, 'MMMM d, yyyy')}`}
     />
   ), [navigation]);
   
-  // Render loading indicator
+  // Handle tab change with haptic feedback
+  const handleTabChange = (tab) => {
+    if (tab !== activeTab) {
+      setActiveTab(tab);
+      Haptics.selectionLight();
+    }
+  };
+  
+  // Navigate to followers list
+  const navigateToFollowers = () => {
+    if (stats.followersCount > 0) {
+      navigation.navigate('UserFollowers', { 
+        userId: userId,
+        title: `${displayName}'s Followers`
+      });
+    }
+  };
+  
+  // Navigate to following list
+  const navigateToFollowing = () => {
+    if (stats.followingCount > 0) {
+      navigation.navigate('UserFollowing', { 
+        userId: userId,
+        title: `${displayName}'s Following`
+      });
+    }
+  };
+  
+  // Get display name
+  const displayName = userData 
+    ? `${userData.firstName || ''} ${userData.lastName || ''}`.trim() 
+    : 'User';
+  
+  // Rendering loading indicator
   if (loading) {
     return (
-      <View style={[styles.loadingContainer, { backgroundColor: theme.colors.background.default }]}>
+      <View 
+        style={[styles.loadingContainer, { backgroundColor: theme.colors.background.default }]}
+        accessibilityLabel="Loading profile"
+      >
         <ActivityIndicator size="large" color={theme.colors.primary.main} />
         <Text style={[styles.loadingText, { color: theme.colors.text.secondary }]}>
           Loading profile...
@@ -500,10 +661,13 @@ const UserProfileScreen = ({ route, navigation }) => {
     );
   }
   
-  // Render error state
+  // Rendering error state
   if (error) {
     return (
-      <View style={[styles.errorContainer, { backgroundColor: theme.colors.background.default }]}>
+      <View 
+        style={[styles.errorContainer, { backgroundColor: theme.colors.background.default }]}
+        accessibilityLabel="Error loading profile"
+      >
         <Icon name="alert-circle-outline" size={64} color={theme.colors.error.main} />
         <Text style={[styles.errorTitle, { color: theme.colors.text.primary }]}>
           Error
@@ -514,6 +678,8 @@ const UserProfileScreen = ({ route, navigation }) => {
         <TouchableOpacity 
           style={[styles.retryButton, { backgroundColor: theme.colors.primary.main }]}
           onPress={fetchUserData}
+          accessibilityLabel="Retry loading profile"
+          accessibilityRole="button"
         >
           <Text style={styles.retryButtonText}>Retry</Text>
         </TouchableOpacity>
@@ -521,16 +687,28 @@ const UserProfileScreen = ({ route, navigation }) => {
     );
   }
   
-  // Get display name
-  const displayName = userData 
-    ? `${userData.firstName || ''} ${userData.lastName || ''}`.trim() 
-    : 'User';
-  
   return (
-    <View style={[styles.container, { backgroundColor: theme.colors.background.default }]}>
-      <ScrollView>
+    <View 
+      style={[
+        styles.container, 
+        { 
+          backgroundColor: theme.colors.background.default,
+          paddingTop: insets.top,
+          paddingBottom: insets.bottom
+        }
+      ]}
+      accessibilityLabel={`Profile of ${displayName}`}
+    >
+      <ScrollView
+        refreshing={refreshing}
+        onRefresh={handleRefresh}
+        showsVerticalScrollIndicator={false}
+      >
         {/* User info header */}
-        <View style={[styles.header, { backgroundColor: theme.colors.background.paper }]}>
+        <View 
+          style={[styles.header, { backgroundColor: theme.colors.background.paper }]}
+          accessibilityRole="header"
+        >
           <View style={styles.profileImageContainer}>
             {userData?.profileImageURL ? (
               <FastImage
@@ -538,30 +716,45 @@ const UserProfileScreen = ({ route, navigation }) => {
                 source={{ uri: userData.profileImageURL }}
                 resizeMode={FastImage.resizeMode.cover}
                 defaultSource={require('../assets/default-avatar.png')}
+                accessible={true}
+                accessibilityLabel={`Profile picture of ${displayName}`}
               />
             ) : (
-              <View style={[
-                styles.profileImage, 
-                styles.placeholderProfile,
-                { backgroundColor: theme.colors.gray[400] }
-              ]}>
+              <View 
+                style={[
+                  styles.profileImage, 
+                  styles.placeholderProfile,
+                  { backgroundColor: theme.colors.gray[400] }
+                ]}
+                accessible={true}
+                accessibilityLabel="Default profile picture"
+              >
                 <Icon name="person" size={40} color="#FFF" />
               </View>
             )}
           </View>
           
-          <Text style={[styles.userName, { color: theme.colors.text.primary }]}>
+          <Text 
+            style={[styles.userName, { color: theme.colors.text.primary }]}
+            accessibilityRole="header"
+          >
             {displayName}
           </Text>
           
           {userData?.bio && !userIsBlocked && (
-            <Text style={[styles.bio, { color: theme.colors.text.secondary }]}>
+            <Text 
+              style={[styles.bio, { color: theme.colors.text.secondary }]}
+              accessibilityLabel={`Bio: ${userData.bio}`}
+            >
               {userData.bio}
             </Text>
           )}
           
           {userIsBlocked && (
-            <View style={[styles.blockedBanner, { backgroundColor: theme.colors.error.light }]}>
+            <View 
+              style={[styles.blockedBanner, { backgroundColor: theme.colors.error.light }]}
+              accessibilityLabel="You have blocked this user"
+            >
               <Icon name="ban" size={20} color={theme.colors.error.main} />
               <Text style={[styles.blockedText, { color: theme.colors.error.main }]}>
                 You have blocked this user
@@ -570,14 +763,18 @@ const UserProfileScreen = ({ route, navigation }) => {
           )}
           
           {/* Stats section */}
-          <View style={[
-            styles.statsContainer,
-            { 
-              borderColor: theme.colors.divider 
-            }
-          ]}>
+          <View 
+            style={[
+              styles.statsContainer,
+              { borderColor: theme.colors.divider }
+            ]}
+            accessibilityLabel="Profile statistics"
+          >
             <View style={styles.statItem}>
-              <Text style={[styles.statNumber, { color: theme.colors.text.primary }]}>
+              <Text 
+                style={[styles.statNumber, { color: theme.colors.text.primary }]}
+                accessibilityLabel={`${stats.postsCount} posts`}
+              >
                 {stats.postsCount}
               </Text>
               <Text style={[styles.statLabel, { color: theme.colors.text.secondary }]}>
@@ -587,25 +784,39 @@ const UserProfileScreen = ({ route, navigation }) => {
             
             <View style={[styles.statDivider, { backgroundColor: theme.colors.divider }]} />
             
-            <View style={styles.statItem}>
+            <TouchableOpacity 
+              style={styles.statItem}
+              onPress={navigateToFollowers}
+              disabled={stats.followersCount === 0}
+              accessibilityLabel={`${stats.followersCount} followers. ${stats.followersCount > 0 ? 'Double tap to view' : ''}`}
+              accessibilityRole={stats.followersCount > 0 ? "button" : "none"}
+              accessibilityHint={stats.followersCount > 0 ? "View list of followers" : ""}
+            >
               <Text style={[styles.statNumber, { color: theme.colors.text.primary }]}>
                 {stats.followersCount}
               </Text>
               <Text style={[styles.statLabel, { color: theme.colors.text.secondary }]}>
                 Followers
               </Text>
-            </View>
+            </TouchableOpacity>
             
             <View style={[styles.statDivider, { backgroundColor: theme.colors.divider }]} />
             
-            <View style={styles.statItem}>
+            <TouchableOpacity 
+              style={styles.statItem}
+              onPress={navigateToFollowing}
+              disabled={stats.followingCount === 0}
+              accessibilityLabel={`${stats.followingCount} following. ${stats.followingCount > 0 ? 'Double tap to view' : ''}`}
+              accessibilityRole={stats.followingCount > 0 ? "button" : "none"}
+              accessibilityHint={stats.followingCount > 0 ? "View list of accounts followed" : ""}
+            >
               <Text style={[styles.statNumber, { color: theme.colors.text.primary }]}>
                 {stats.followingCount}
               </Text>
               <Text style={[styles.statLabel, { color: theme.colors.text.secondary }]}>
                 Following
               </Text>
-            </View>
+            </TouchableOpacity>
           </View>
           
           {/* Actions */}
@@ -626,6 +837,9 @@ const UserProfileScreen = ({ route, navigation }) => {
               ]}
               onPress={toggleFollow}
               disabled={followLoading || userIsBlocked}
+              accessibilityLabel={isFollowing ? "Unfollow" : "Follow"}
+              accessibilityRole="button"
+              accessibilityState={{ disabled: followLoading || userIsBlocked }}
             >
               {followLoading ? (
                 <ActivityIndicator 
@@ -651,6 +865,8 @@ const UserProfileScreen = ({ route, navigation }) => {
                 { backgroundColor: theme.colors.background.paper }
               ]}
               onPress={handleShareProfile}
+              accessibilityLabel="Share Profile"
+              accessibilityRole="button"
             >
               <Text style={[
                 styles.actionButtonText,
@@ -667,6 +883,7 @@ const UserProfileScreen = ({ route, navigation }) => {
                 { backgroundColor: theme.colors.background.paper }
               ]}
               onPress={() => {
+                Haptics.selectionLight();
                 Alert.alert(
                   'More Options',
                   null,
@@ -685,6 +902,9 @@ const UserProfileScreen = ({ route, navigation }) => {
                   ]
                 );
               }}
+              accessibilityLabel="More options"
+              accessibilityRole="button"
+              accessibilityHint="Open menu with additional actions like block and report"
             >
               <Text style={[
                 styles.actionButtonText,
@@ -697,7 +917,10 @@ const UserProfileScreen = ({ route, navigation }) => {
           
           {/* Medical conditions */}
           {userData?.medicalConditions && userData.medicalConditions.length > 0 && !userIsBlocked && (
-            <View style={styles.conditionsContainer}>
+            <View 
+              style={styles.conditionsContainer}
+              accessibilityLabel="Medical conditions"
+            >
               <Text style={[
                 styles.conditionsTitle,
                 { color: theme.colors.text.primary }
@@ -708,6 +931,7 @@ const UserProfileScreen = ({ route, navigation }) => {
                 horizontal 
                 showsHorizontalScrollIndicator={false}
                 contentContainerStyle={styles.conditionsList}
+                accessibilityLabel={`Medical conditions: ${userData.medicalConditions.join(', ')}`}
               >
                 {userData.medicalConditions.map((condition, index) => (
                   <View 
@@ -716,6 +940,8 @@ const UserProfileScreen = ({ route, navigation }) => {
                       styles.conditionTag,
                       { backgroundColor: theme.colors.primary.lightest }
                     ]}
+                    accessible={true}
+                    accessibilityLabel={condition}
                   >
                     <Text style={[
                       styles.conditionText,
@@ -746,7 +972,10 @@ const UserProfileScreen = ({ route, navigation }) => {
                 { borderBottomColor: theme.colors.primary.main }
               ]
             ]}
-            onPress={() => setActiveTab('posts')}
+            onPress={() => handleTabChange('posts')}
+            accessibilityLabel="Posts tab"
+            accessibilityRole="tab"
+            accessibilityState={{ selected: activeTab === 'posts' }}
           >
             <Icon 
               name="grid-outline" 
@@ -778,7 +1007,10 @@ const UserProfileScreen = ({ route, navigation }) => {
                 { borderBottomColor: theme.colors.primary.main }
               ]
             ]}
-            onPress={() => setActiveTab('about')}
+            onPress={() => handleTabChange('about')}
+            accessibilityLabel="About tab"
+            accessibilityRole="tab"
+            accessibilityState={{ selected: activeTab === 'about' }}
           >
             <Icon 
               name="information-circle-outline" 
@@ -821,6 +1053,8 @@ const UserProfileScreen = ({ route, navigation }) => {
                     { backgroundColor: theme.colors.primary.main }
                   ]}
                   onPress={handleBlockToggle}
+                  accessibilityLabel="Unblock user"
+                  accessibilityRole="button"
                 >
                   <Text style={styles.unblockButtonText}>Unblock User</Text>
                 </TouchableOpacity>
@@ -841,11 +1075,14 @@ const UserProfileScreen = ({ route, navigation }) => {
               </View>
             ) : (
               <FlatList
+                ref={flatListRef}
                 data={posts}
                 keyExtractor={item => item.id}
                 numColumns={3}
                 scrollEnabled={false}
                 renderItem={renderPostItem}
+                contentContainerStyle={styles.postsGrid}
+                accessibilityLabel={`${posts.length} posts from ${displayName}`}
               />
             )}
           </View>
@@ -858,21 +1095,30 @@ const UserProfileScreen = ({ route, navigation }) => {
               <>
                 <View style={[styles.infoRow, { borderBottomColor: theme.colors.divider }]}>
                   <Icon name="mail-outline" size={20} color={theme.colors.text.secondary} />
-                  <Text style={[styles.infoText, { color: theme.colors.text.primary }]}>
+                  <Text 
+                    style={[styles.infoText, { color: theme.colors.text.primary }]}
+                    accessibilityLabel={`Email: ${userData?.email || 'No email provided'}`}
+                  >
                     {userData?.email || 'No email provided'}
                   </Text>
                 </View>
                 
                 <View style={[styles.infoRow, { borderBottomColor: theme.colors.divider }]}>
                   <Icon name="transgender-outline" size={20} color={theme.colors.text.secondary} />
-                  <Text style={[styles.infoText, { color: theme.colors.text.primary }]}>
+                  <Text 
+                    style={[styles.infoText, { color: theme.colors.text.primary }]}
+                    accessibilityLabel={`Gender: ${userData?.gender || 'Not specified'}`}
+                  >
                     {userData?.gender || 'Not specified'}
                   </Text>
                 </View>
                 
                 <View style={[styles.infoRow, { borderBottomColor: theme.colors.divider }]}>
                   <Icon name="calendar-outline" size={20} color={theme.colors.text.secondary} />
-                  <Text style={[styles.infoText, { color: theme.colors.text.primary }]}>
+                  <Text 
+                    style={[styles.infoText, { color: theme.colors.text.primary }]}
+                    accessibilityLabel={`Joined ${formatJoinDate()}`}
+                  >
                     Joined {formatJoinDate()}
                   </Text>
                 </View>
@@ -892,6 +1138,8 @@ const UserProfileScreen = ({ route, navigation }) => {
                     { backgroundColor: theme.colors.primary.main }
                   ]}
                   onPress={handleBlockToggle}
+                  accessibilityLabel="Unblock user"
+                  accessibilityRole="button"
                 >
                   <Text style={styles.unblockButtonText}>Unblock User</Text>
                 </TouchableOpacity>
@@ -920,11 +1168,655 @@ const UserProfileScreen = ({ route, navigation }) => {
               ]}>
                 Block {displayName}
               </Text>
-              <TouchableOpacity onPress={() => setBlockModalVisible(false)}>
+              <TouchableOpacity 
+                onPress={() => setBlockModalVisible(false)}
+                accessibilityLabel="Close"
+                accessibilityRole="button"
+              >
                 <Icon name="close" size={24} color={theme.colors.text.secondary} />
               </TouchableOpacity>
             </View>
             
             <Text style={[
               styles.modalDescription,
+              { color: theme.colors.text.secondary }
+            ]}>
+              When you block someone, they won't be able to follow you or view your posts.
+              They also won't be notified that you blocked them.
+            </Text>
+            
+            <Text style={[
+              styles.reasonLabel,
+              { color: theme.colors.text.primary }
+            ]}>
+              Reason for blocking (optional):
+            </Text>
+            
+            <View style={styles.reasonOptions}>
+              <TouchableOpacity 
+                style={[
+                  styles.reasonOption,
+                  blockReason === 'Harassment' && [
+                    styles.selectedReasonOption,
+                    { backgroundColor: theme.colors.primary.lightest }
+                  ]
+                ]}
+                onPress={() => setBlockReason('Harassment')}
+                accessibilityLabel="Harassment"
+                accessibilityRole="radio"
+                accessibilityState={{ checked: blockReason === 'Harassment' }}
+              >
+                <Text style={[
+                  styles.reasonText,
+                  blockReason === 'Harassment' && { color: theme.colors.primary.main }
+                ]}>
+                  Harassment
+                </Text>
+              </TouchableOpacity>
               
+              <TouchableOpacity 
+                style={[
+                  styles.reasonOption,
+                  blockReason === 'Inappropriate Content' && [
+                    styles.selectedReasonOption,
+                    { backgroundColor: theme.colors.primary.lightest }
+                  ]
+                ]}
+                onPress={() => setBlockReason('Inappropriate Content')}
+                accessibilityLabel="Inappropriate Content"
+                accessibilityRole="radio"
+                accessibilityState={{ checked: blockReason === 'Inappropriate Content' }}
+              >
+                <Text style={[
+                  styles.reasonText,
+                  blockReason === 'Inappropriate Content' && { color: theme.colors.primary.main }
+                ]}>
+                  Inappropriate Content
+                </Text>
+              </TouchableOpacity>
+              
+              <TouchableOpacity 
+                style={[
+                  styles.reasonOption,
+                  blockReason === 'Spam' && [
+                    styles.selectedReasonOption,
+                    { backgroundColor: theme.colors.primary.lightest }
+                  ]
+                ]}
+                onPress={() => setBlockReason('Spam')}
+                accessibilityLabel="Spam"
+                accessibilityRole="radio"
+                accessibilityState={{ checked: blockReason === 'Spam' }}
+              >
+                <Text style={[
+                  styles.reasonText,
+                  blockReason === 'Spam' && { color: theme.colors.primary.main }
+                ]}>
+                  Spam
+                </Text>
+              </TouchableOpacity>
+              
+              <TouchableOpacity 
+                style={[
+                  styles.reasonOption,
+                  blockReason === 'Other' && [
+                    styles.selectedReasonOption,
+                    { backgroundColor: theme.colors.primary.lightest }
+                  ]
+                ]}
+                onPress={() => setBlockReason('Other')}
+                accessibilityLabel="Other"
+                accessibilityRole="radio"
+                accessibilityState={{ checked: blockReason === 'Other' }}
+              >
+                <Text style={[
+                  styles.reasonText,
+                  blockReason === 'Other' && { color: theme.colors.primary.main }
+                ]}>
+                  Other
+                </Text>
+              </TouchableOpacity>
+            </View>
+            
+            {blockReason === 'Other' && (
+              <TextInput
+                style={[
+                  styles.customReasonInput,
+                  { 
+                    color: theme.colors.text.primary,
+                    backgroundColor: theme.colors.background.input,
+                    borderColor: theme.colors.divider 
+                  }
+                ]}
+                placeholder="Please specify a reason..."
+                placeholderTextColor={theme.colors.text.hint}
+                value={customBlockReason}
+                onChangeText={setCustomBlockReason}
+                maxLength={100}
+                multiline
+                accessibilityLabel="Custom reason for blocking"
+                accessibilityHint="Enter your own reason for blocking this user"
+              />
+            )}
+            
+            <View style={styles.modalActions}>
+              <TouchableOpacity 
+                style={[
+                  styles.cancelButton,
+                  { borderColor: theme.colors.divider }
+                ]}
+                onPress={() => setBlockModalVisible(false)}
+                accessibilityLabel="Cancel"
+                accessibilityRole="button"
+              >
+                <Text style={[
+                  styles.cancelButtonText,
+                  { color: theme.colors.text.primary }
+                ]}>
+                  Cancel
+                </Text>
+              </TouchableOpacity>
+              
+              <TouchableOpacity 
+                style={[
+                  styles.blockButton,
+                  { backgroundColor: theme.colors.error.main }
+                ]}
+                onPress={handleSubmitBlock}
+                accessibilityLabel="Block User"
+                accessibilityRole="button"
+              >
+                <Text style={styles.blockButtonText}>
+                  Block User
+                </Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+      
+      {/* Report User Modal */}
+      <Modal
+        visible={reportModalVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setReportModalVisible(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={[
+            styles.modalContainer,
+            { backgroundColor: theme.colors.background.paper }
+          ]}>
+            <View style={styles.modalHeader}>
+              <Text style={[
+                styles.modalTitle,
+                { color: theme.colors.text.primary }
+              ]}>
+                Report {displayName}
+              </Text>
+              <TouchableOpacity 
+                onPress={() => setReportModalVisible(false)}
+                accessibilityLabel="Close"
+                accessibilityRole="button"
+              >
+                <Icon name="close" size={24} color={theme.colors.text.secondary} />
+              </TouchableOpacity>
+            </View>
+            
+            <Text style={[
+              styles.modalDescription,
+              { color: theme.colors.text.secondary }
+            ]}>
+              Please select a reason for reporting this user. Our team will review the report.
+            </Text>
+            
+            <View style={styles.reportOptions}>
+              <TouchableOpacity 
+                style={[
+                  styles.reportOption,
+                  { borderBottomColor: theme.colors.divider }
+                ]}
+                onPress={() => submitReport('Harassment or Bullying')}
+                accessibilityLabel="Report for Harassment or Bullying"
+                accessibilityRole="button"
+              >
+                <Icon name="alert-circle-outline" size={20} color={theme.colors.error.main} />
+                <Text style={[
+                  styles.reportOptionText,
+                  { color: theme.colors.text.primary }
+                ]}>
+                  Harassment or Bullying
+                </Text>
+              </TouchableOpacity>
+              
+              <TouchableOpacity 
+                style={[
+                  styles.reportOption,
+                  { borderBottomColor: theme.colors.divider }
+                ]}
+                onPress={() => submitReport('Inappropriate Content')}
+                accessibilityLabel="Report for Inappropriate Content"
+                accessibilityRole="button"
+              >
+                <Icon name="eye-off-outline" size={20} color={theme.colors.error.main} />
+                <Text style={[
+                  styles.reportOptionText,
+                  { color: theme.colors.text.primary }
+                ]}>
+                  Inappropriate Content
+                </Text>
+              </TouchableOpacity>
+              
+              <TouchableOpacity 
+                style={[
+                  styles.reportOption,
+                  { borderBottomColor: theme.colors.divider }
+                ]}
+                onPress={() => submitReport('Spam or Scam')}
+                accessibilityLabel="Report for Spam or Scam"
+                accessibilityRole="button"
+              >
+                <Icon name="mail-unread-outline" size={20} color={theme.colors.error.main} />
+                <Text style={[
+                  styles.reportOptionText,
+                  { color: theme.colors.text.primary }
+                ]}>
+                  Spam or Scam
+                </Text>
+              </TouchableOpacity>
+              
+              <TouchableOpacity 
+                style={[
+                  styles.reportOption,
+                  { borderBottomColor: theme.colors.divider }
+                ]}
+                onPress={() => submitReport('False Medical Information')}
+                accessibilityLabel="Report for False Medical Information"
+                accessibilityRole="button"
+              >
+                <Icon name="medical-outline" size={20} color={theme.colors.error.main} />
+                <Text style={[
+                  styles.reportOptionText,
+                  { color: theme.colors.text.primary }
+                ]}>
+                  False Medical Information
+                </Text>
+              </TouchableOpacity>
+              
+              <TouchableOpacity 
+                style={styles.reportOption}
+                onPress={() => submitReport('Other')}
+                accessibilityLabel="Report for Other reason"
+                accessibilityRole="button"
+              >
+                <Icon name="ellipsis-horizontal" size={20} color={theme.colors.error.main} />
+                <Text style={[
+                  styles.reportOptionText,
+                  { color: theme.colors.text.primary }
+                ]}>
+                  Other
+                </Text>
+              </TouchableOpacity>
+            </View>
+            
+            <TouchableOpacity 
+              style={[
+                styles.cancelButton,
+                { borderColor: theme.colors.divider, marginTop: 12 }
+              ]}
+              onPress={() => setReportModalVisible(false)}
+              accessibilityLabel="Cancel"
+              accessibilityRole="button"
+            >
+              <Text style={[
+                styles.cancelButtonText,
+                { color: theme.colors.text.primary }
+              ]}>
+                Cancel
+              </Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+    </View>
+  );
+};
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+  },
+  loadingContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  loadingText: {
+    marginTop: 10,
+    fontSize: 16,
+  },
+  errorContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 20,
+  },
+  errorTitle: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    marginTop: 16,
+    marginBottom: 8,
+  },
+  errorMessage: {
+    fontSize: 16,
+    textAlign: 'center',
+    marginBottom: 20,
+  },
+  retryButton: {
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+  },
+  retryButtonText: {
+    color: 'white',
+    fontWeight: 'bold',
+  },
+  header: {
+    padding: 20,
+    alignItems: 'center',
+    borderBottomWidth: 1,
+    borderBottomColor: '#ECEFF1',
+  },
+  profileImageContainer: {
+    marginBottom: 15,
+  },
+  profileImage: {
+    width: 120,
+    height: 120,
+    borderRadius: 60,
+  },
+  placeholderProfile: {
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  userName: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    marginBottom: 5,
+  },
+  bio: {
+    fontSize: 16,
+    textAlign: 'center',
+    marginBottom: 15,
+    paddingHorizontal: 20,
+  },
+  blockedBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+    marginBottom: 15,
+  },
+  blockedText: {
+    marginLeft: 8,
+    fontWeight: '500',
+  },
+  statsContainer: {
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    width: '100%',
+    paddingVertical: 15,
+    borderTopWidth: 1,
+    borderBottomWidth: 1,
+    marginBottom: 15,
+  },
+  statItem: {
+    alignItems: 'center',
+    paddingHorizontal: 5,
+  },
+  statNumber: {
+    fontSize: 18,
+    fontWeight: 'bold',
+  },
+  statLabel: {
+    fontSize: 14,
+  },
+  statDivider: {
+    width: 1,
+    height: '80%',
+  },
+  actionsContainer: {
+    flexDirection: 'row',
+    width: '100%',
+    justifyContent: 'space-between',
+    marginBottom: 15,
+  },
+  actionButton: {
+    flex: 1,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginHorizontal: 4,
+    borderWidth: 1,
+    borderColor: 'transparent',
+  },
+  actionButtonText: {
+    fontWeight: 'bold',
+    fontSize: 15,
+  },
+  followButton: {
+    flex: 1.2,
+  },
+  followButtonText: {
+    color: 'white',
+  },
+  followingButton: {
+    backgroundColor: 'transparent',
+  },
+  conditionsContainer: {
+    width: '100%',
+    marginTop: 5,
+  },
+  conditionsTitle: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    marginBottom: 10,
+  },
+  conditionsList: {
+    paddingBottom: 10,
+  },
+  conditionTag: {
+    borderRadius: 20,
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    marginRight: 8,
+  },
+  conditionText: {
+    fontSize: 14,
+  },
+  tabsContainer: {
+    flexDirection: 'row',
+    borderBottomWidth: 1,
+  },
+  tab: {
+    flex: 1,
+    flexDirection: 'row',
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingVertical: 12,
+  },
+  activeTab: {
+    borderBottomWidth: 2,
+  },
+  tabText: {
+    marginLeft: 5,
+    fontSize: 16,
+  },
+  activeTabText: {
+    fontWeight: 'bold',
+  },
+  postsContainer: {
+    flex: 1,
+    minHeight: 300,
+  },
+  postsGrid: {
+    padding: 1,
+  },
+  loadingPosts: {
+    padding: 40,
+    alignItems: 'center',
+  },
+  emptyContainer: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 40,
+  },
+  emptyTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    marginTop: 10,
+    marginBottom: 5,
+  },
+  emptySubtitle: {
+    fontSize: 14,
+    textAlign: 'center',
+    marginBottom: 20,
+    paddingHorizontal: 20,
+  },
+  unblockButton: {
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+  },
+  unblockButtonText: {
+    color: 'white',
+    fontWeight: 'bold',
+  },
+  aboutContainer: {
+    padding: 20,
+  },
+  infoRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 12,
+    borderBottomWidth: 1,
+  },
+  infoText: {
+    marginLeft: 10,
+    fontSize: 16,
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 20,
+  },
+  modalContainer: {
+    borderRadius: 12,
+    width: '100%',
+    maxWidth: 400,
+    padding: 20,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 3.84,
+    elevation: 5,
+  },
+  modalHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 16,
+  },
+  modalTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+  },
+  modalDescription: {
+    marginBottom: 20,
+    fontSize: 14,
+    lineHeight: 20,
+  },
+  reasonLabel: {
+    fontSize: 16,
+    fontWeight: '500',
+    marginBottom: 12,
+  },
+  reasonOptions: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    marginBottom: 20,
+  },
+  reasonOption: {
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: 'rgba(0, 0, 0, 0.1)',
+    margin: 4,
+  },
+  selectedReasonOption: {
+    borderColor: 'transparent',
+  },
+  reasonText: {
+    fontSize: 14,
+  },
+  customReasonInput: {
+    height: 100,
+    borderWidth: 1,
+    borderRadius: 8,
+    padding: 12,
+    fontSize: 14,
+    textAlignVertical: 'top',
+    marginBottom: 20,
+  },
+  modalActions: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  cancelButton: {
+    flex: 1,
+    paddingVertical: 12,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    marginRight: 8,
+  },
+  cancelButtonText: {
+    fontSize: 16,
+    fontWeight: '500',
+  },
+  blockButton: {
+    flex: 1,
+    paddingVertical: 12,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginLeft: 8,
+  },
+  blockButtonText: {
+    color: 'white',
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
+  reportOptions: {
+    marginBottom: 12,
+  },
+  reportOption: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 14,
+    borderBottomWidth: 1,
+  },
+  reportOptionText: {
+    fontSize: 16,
+    marginLeft: 12,
+  }
+});
+
+export default UserProfileScreen;
