@@ -1,22 +1,34 @@
 // src/utils/FirebaseUtils.js
-// Utility functions for Firebase operations
+// Improved utility functions for Firebase operations
 
 import auth from '@react-native-firebase/auth';
 import firestore from '@react-native-firebase/firestore';
 import storage from '@react-native-firebase/storage';
-import { Platform } from 'react-native';
+import { Platform, AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo from '@react-native-community/netinfo';
 import RNFS from 'react-native-fs';
 import { sanitizeInput } from './validationUtils';
 import { getAuthErrorMessage, getFirestoreErrorMessage, getStorageErrorMessage, withErrorHandling } from './errorUtils';
+import uuid from 'react-native-uuid';
 
 // Import the SecurityUtils class
 import SecurityUtils from './SecurityUtils';
 
+// Offline operation status constants
+const OPERATION_STATUS = {
+  PENDING: 'pending',
+  PROCESSING: 'processing',
+  COMPLETED: 'completed',
+  FAILED: 'failed'
+};
+
+// Maximum number of retries for operations
+const MAX_RETRIES = 5;
+
 /**
- * Firebase utilities for authentication, data operations,
- * storage, and messaging
+ * Enhanced Firebase utilities for authentication, data operations,
+ * storage, and messaging with improved offline support and conflict resolution
  */
 class FirebaseUtils {
   /**
@@ -30,10 +42,17 @@ class FirebaseUtils {
     this.isConnected = true;
     this.offlineQueue = [];
     this.pendingUploads = [];
-    this.securityUtils = new SecurityUtils();
+    this.securityUtils = SecurityUtils;
+    this.isSyncing = false;
+    this.syncInterval = null;
+    this.netInfoUnsubscribe = null;
+    this.appStateSubscription = null;
 
     // Initialize network listener
     this.initNetworkListener();
+    
+    // Initialize app state listener to detect background/foreground transitions
+    this.initAppStateListener();
 
     // Initialize current user
     this.auth().onAuthStateChanged(user => {
@@ -44,1316 +63,650 @@ class FirebaseUtils {
         this.syncOfflineOperations();
       }
     });
+    
+    // Set up periodic sync attempts for queued operations
+    this.setupPeriodicSync();
   }
 
   /**
-   * Initialize network connectivity listener
+   * Initialize network connectivity listener with improved handling
    */
   initNetworkListener() {
-    NetInfo.addEventListener(state => {
+    // Clean up existing listener if any
+    if (this.netInfoUnsubscribe) {
+      this.netInfoUnsubscribe();
+    }
+    
+    this.netInfoUnsubscribe = NetInfo.addEventListener(state => {
       const wasConnected = this.isConnected;
-      this.isConnected = state.isConnected;
+      this.isConnected = state.isConnected && state.isInternetReachable !== false;
       
-      if (!state.isConnected) {
-        console.log('Network is disconnected. Firebase operations may be queued.');
-      } else if (!wasConnected && state.isConnected) {
-        // Connection has been restored, try to sync pending operations
+      if (!this.isConnected) {
+        console.log('Network is disconnected. Firebase operations will be queued.');
+        // Clear any ongoing sync when disconnected
+        this.isSyncing = false;
+      } else if (!wasConnected && this.isConnected) {
+        console.log('Network connection restored. Syncing pending operations...');
+        // Give a small delay before syncing to ensure connection is stable
+        setTimeout(() => {
+          this.syncOfflineOperations();
+        }, 2000);
+      }
+    });
+  }
+  
+  /**
+   * Initialize app state listener to sync when app returns to foreground
+   */
+  initAppStateListener() {
+    // Clean up existing listener if any
+    if (this.appStateSubscription) {
+      this.appStateSubscription.remove();
+    }
+    
+    this.appStateSubscription = AppState.addEventListener('change', nextAppState => {
+      if (nextAppState === 'active' && this.isConnected && this.currentUser) {
+        // App has come to the foreground
         this.syncOfflineOperations();
       }
     });
   }
+  
+  /**
+   * Set up periodic sync attempts for resilience
+   */
+  setupPeriodicSync() {
+    // Clear existing interval if any
+    if (this.syncInterval) {
+      clearInterval(this.syncInterval);
+    }
+    
+    // Try to sync every 5 minutes if there are pending operations
+    this.syncInterval = setInterval(async () => {
+      try {
+        if (this.isConnected && this.currentUser && !this.isSyncing) {
+          const hasPendingOps = 
+            this.offlineQueue.length > 0 || 
+            await this.hasPendingOperations();
+          
+          if (hasPendingOps) {
+            this.syncOfflineOperations();
+          }
+        }
+      } catch (error) {
+        console.error('Error in periodic sync check:', error);
+      }
+    }, 5 * 60 * 1000); // 5 minutes
+  }
+
+  /**
+   * Check if there are any pending operations in storage
+   * @returns {Promise<boolean>} Whether there are pending operations
+   */
+  async hasPendingOperations() {
+    try {
+      const keys = await AsyncStorage.getAllKeys();
+      
+      // Look for keys that indicate pending operations
+      return keys.some(key => 
+        key.startsWith('pending_') || 
+        key.includes('_pending') ||
+        key.includes('_pendingUpdates') ||
+        key.includes('pendingUploads') ||
+        key.includes('pendingShares') ||
+        key.includes('pendingAuditLogs') ||
+        key.includes('offlineQueue') ||
+        key.includes('pendingDeletions')
+      );
+    } catch (error) {
+      console.error('Error checking for pending operations:', error);
+      return false;
+    }
+  }
 
   /**
    * Synchronize offline operations when connection is restored
+   * Improved with transaction safety, conflict resolution, and chunked processing
    */
   async syncOfflineOperations() {
-    if (!this.isConnected || !this.currentUser) return;
+    if (!this.isConnected || !this.currentUser || this.isSyncing) return;
     
     try {
+      this.isSyncing = true;
+      console.log('Starting offline operation sync...');
+      
+      // Load persisted queue first
+      await this.loadOfflineQueue();
+      
       // Sync pending shares
+      await this.syncPendingShares();
+      
+      // Let security utils sync its pending logs
+      await this.securityUtils.syncPendingAuditLogs();
+      
+      // Process any pending uploads first
+      await this.processPendingUploads();
+      
+      // Process queued operations in order with conflict resolution
+      await this.processOfflineQueue();
+      
+      // Process any pending document changes
+      await this.processPendingDocuments();
+      
+      console.log('Offline operation sync completed');
+    } catch (error) {
+      console.error('Error syncing offline operations:', error);
+    } finally {
+      this.isSyncing = false;
+    }
+  }
+
+  /**
+   * Load offline queue from persistent storage
+   */
+  async loadOfflineQueue() {
+    try {
+      const queueData = await AsyncStorage.getItem('offlineQueue');
+      if (queueData) {
+        const savedQueue = JSON.parse(queueData);
+        
+        // Filter out any invalid operations and merge with current queue
+        const validOperations = savedQueue.filter(op => 
+          op && op.type && op.data && op.timestamp
+        );
+        
+        // Merge with in-memory queue, avoiding duplicates
+        const existingOpIds = new Set(this.offlineQueue.map(op => op.id));
+        const newOps = validOperations.filter(op => !existingOpIds.has(op.id));
+        
+        this.offlineQueue = [...this.offlineQueue, ...newOps];
+        
+        console.log(`Loaded ${newOps.length} operations from persistent storage`);
+      }
+    } catch (error) {
+      console.error('Error loading offline queue:', error);
+    }
+  }
+
+  /**
+   * Save offline queue to persistent storage
+   */
+  async saveOfflineQueue() {
+    try {
+      if (this.offlineQueue.length > 0) {
+        await AsyncStorage.setItem('offlineQueue', JSON.stringify(this.offlineQueue));
+      } else {
+        await AsyncStorage.removeItem('offlineQueue');
+      }
+    } catch (error) {
+      console.error('Error saving offline queue:', error);
+    }
+  }
+
+  /**
+   * Process operations in the offline queue
+   * Improved with batching, error handling, and conflict resolution
+   */
+  async processOfflineQueue() {
+    // Sort by timestamp to ensure operations are processed in order
+    this.offlineQueue.sort((a, b) => a.timestamp - b.timestamp);
+    
+    const queueLength = this.offlineQueue.length;
+    let processedCount = 0;
+    let successCount = 0;
+    let failedCount = 0;
+    
+    console.log(`Processing ${queueLength} queued operations...`);
+    
+    // Process in chunks to avoid blocking UI
+    const chunkSize = 10;
+    
+    while (this.offlineQueue.length > 0 && this.isConnected) {
+      // Process a chunk of operations
+      const chunk = this.offlineQueue.splice(0, chunkSize);
+      
+      // Create a promise for each operation with timeout
+      const results = await Promise.allSettled(
+        chunk.map(operation => {
+          return Promise.race([
+            this.processOperation(operation),
+            new Promise((_, reject) => {
+              setTimeout(() => {
+                reject(new Error('Operation timed out'));
+              }, 30000); // 30 second timeout
+            })
+          ]);
+        })
+      );
+      
+      // Handle results
+      results.forEach((result, index) => {
+        const operation = chunk[index];
+        
+        if (result.status === 'fulfilled' && result.value) {
+          // Operation succeeded
+          successCount++;
+        } else {
+          // Operation failed
+          failedCount++;
+          console.error(`Operation failed:`, operation, result.reason || 'Unknown error');
+          
+          // Retry operation if retries remaining
+          if (!operation.retryCount || operation.retryCount < MAX_RETRIES) {
+            // Exponential backoff
+            const retryCount = (operation.retryCount || 0) + 1;
+            const backoffDelay = Math.min(60000, Math.pow(2, retryCount) * 1000); // Cap at 1 minute
+            
+            // Add back to queue with retry info and delay
+            this.offlineQueue.push({
+              ...operation,
+              retryCount,
+              timestamp: Date.now() + backoffDelay
+            });
+          }
+        }
+      });
+      
+      processedCount += chunk.length;
+      
+      // Yield to event loop occasionally to prevent UI blocking
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
+      // Save remaining queue to persistent storage
+      await this.saveOfflineQueue();
+    }
+    
+    console.log(`Processed ${processedCount} operations: ${successCount} succeeded, ${failedCount} failed`);
+  }
+
+  /**
+   * Sync pending shares
+   * Processes pending post shares that were created while offline
+   */
+  async syncPendingShares() {
+    try {
       const pendingShares = JSON.parse(await AsyncStorage.getItem('pendingShares') || '[]');
-      if (pendingShares.length > 0) {
-        for (const share of pendingShares) {
-          try {
-            await this.firestore().collection('posts').doc(share.postId).update({
+      if (pendingShares.length === 0) return;
+      
+      console.log(`Processing ${pendingShares.length} pending shares...`);
+      
+      const batch = this.firestore().batch();
+      let batchCount = 0;
+      const maxBatchSize = 500; // Firestore batch limit
+      const processedShares = [];
+      
+      for (const share of pendingShares) {
+        try {
+          // Verify post still exists
+          const postRef = this.firestore().collection('posts').doc(share.postId);
+          const postDoc = await postRef.get();
+          
+          if (postDoc.exists) {
+            // Update share count on post
+            batch.update(postRef, {
               shareCount: firestore.FieldValue.increment(1),
               lastUpdated: firestore.FieldValue.serverTimestamp()
             });
             
-            await this.firestore().collection('postShares').add({
-              ...share,
-              timestamp: firestore.FieldValue.serverTimestamp()
-            });
-          } catch (error) {
-            console.error('Error syncing pending share:', error);
-          }
-        }
-        
-        await AsyncStorage.setItem('pendingShares', JSON.stringify([]));
-      }
-      
-      // Sync pending audit logs
-      const pendingLogs = JSON.parse(await AsyncStorage.getItem('pendingAuditLogs') || '[]');
-      if (pendingLogs.length > 0) {
-        const batch = this.firestore().batch();
-        let batchCount = 0;
-        const maxBatchSize = 500; // Firestore batch limit
-        
-        for (const log of pendingLogs) {
-          try {
-            const newLogRef = this.firestore().collection('auditLogs').doc();
-            batch.set(newLogRef, {
-              ...log,
-              timestamp: firestore.FieldValue.serverTimestamp(),
-              syncedFromOffline: true
+            // Create share record
+            const shareRef = this.firestore().collection('postShares').doc();
+            batch.set(shareRef, {
+              postId: share.postId,
+              userId: share.userId,
+              sharedWith: share.sharedWith || 'external',
+              platform: share.platform || 'other',
+              timestamp: share.timestamp 
+                ? firestore.Timestamp.fromMillis(share.timestamp) 
+                : firestore.FieldValue.serverTimestamp()
             });
             
-            batchCount++;
+            batchCount += 2; // Counting both operations
+            processedShares.push(share);
             
             // Commit batch when it reaches max size
             if (batchCount >= maxBatchSize) {
               await batch.commit();
+              batch = this.firestore().batch();
               batchCount = 0;
             }
-          } catch (error) {
-            console.error('Error preparing audit log batch:', error);
+          } else {
+            // Post doesn't exist anymore, skip this share
+            processedShares.push(share);
           }
-        }
-        
-        // Commit remaining batch operations
-        if (batchCount > 0) {
-          await batch.commit();
-        }
-        
-        await AsyncStorage.setItem('pendingAuditLogs', JSON.stringify([]));
-      }
-      
-      // Process queued operations in order
-      const queueLength = this.offlineQueue.length;
-      let processedCount = 0;
-      const maxRetries = 3;
-      
-      while (this.offlineQueue.length > 0 && this.isConnected) {
-        const operation = this.offlineQueue.shift();
-        let success = false;
-        let retries = 0;
-        
-        while (!success && retries < maxRetries) {
-          try {
-            await operation.execute();
-            success = true;
-          } catch (error) {
-            retries++;
-            console.error(`Error executing queued operation (retry ${retries}/${maxRetries}):`, error);
-            
-            if (retries >= maxRetries) {
-              // Log failed operation for debugging
-              console.error('Operation failed after max retries:', operation);
-            } else {
-              // Wait before retry
-              await new Promise(resolve => setTimeout(resolve, 1000 * retries));
-            }
-          }
-        }
-        
-        processedCount++;
-        
-        // Yield to event loop occasionally to prevent UI blocking
-        if (processedCount % 10 === 0) {
-          await new Promise(resolve => setTimeout(resolve, 0));
+        } catch (error) {
+          console.error('Error processing pending share:', error);
         }
       }
       
-      // Sync pending uploads if any
-      await this.processPendingUploads();
+      // Commit remaining batch operations
+      if (batchCount > 0) {
+        await batch.commit();
+      }
       
+      // Remove processed shares from pending list
+      const remainingShares = pendingShares.filter(share => 
+        !processedShares.some(processed => 
+          processed.postId === share.postId && 
+          processed.timestamp === share.timestamp
+        )
+      );
+      
+      await AsyncStorage.setItem('pendingShares', JSON.stringify(remainingShares));
+      console.log(`Processed ${processedShares.length} pending shares`);
     } catch (error) {
-      console.error('Error syncing offline operations:', error);
+      console.error('Error syncing pending shares:', error);
     }
   }
-
+  
   /**
-   * Process pending file uploads
+   * Process pending document operations
+   * Handles creates, updates, and deletions that were stored while offline
    */
-  async processPendingUploads() {
+  async processPendingDocuments() {
     try {
-      const pendingUploads = JSON.parse(await AsyncStorage.getItem('pendingUploads') || '[]');
+      // Get all AsyncStorage keys
+      const allKeys = await AsyncStorage.getAllKeys();
       
-      if (pendingUploads.length === 0) return;
+      // Process pending document creations for each collection
+      const pendingCreationKeys = allKeys.filter(key => key.startsWith('pending_') && !key.includes('Deletions') && !key.includes('Updates'));
       
-      for (const upload of pendingUploads) {
+      for (const key of pendingCreationKeys) {
+        const collection = key.replace('pending_', '');
+        await this.processPendingCreations(collection);
+      }
+      
+      // Process pending document updates for each collection
+      const pendingUpdateKeys = allKeys.filter(key => key.includes('_pendingUpdates'));
+      
+      for (const key of pendingUpdateKeys) {
+        const collection = key.replace('pending_updates_', '');
+        await this.processPendingUpdates(collection);
+      }
+      
+      // Process pending document deletions for each collection
+      const pendingDeletionKeys = allKeys.filter(key => key.includes('_pendingDeletions'));
+      
+      for (const key of pendingDeletionKeys) {
+        const collection = key.replace('pending_deletions_', '');
+        await this.processPendingDeletions(collection);
+      }
+    } catch (error) {
+      console.error('Error processing pending documents:', error);
+    }
+  }
+  
+  /**
+   * Process pending document creations for a collection
+   * @param {string} collection - Collection name
+   */
+  async processPendingCreations(collection) {
+    try {
+      const pendingDocs = JSON.parse(await AsyncStorage.getItem(`pending_${collection}`) || '[]');
+      if (pendingDocs.length === 0) return;
+      
+      console.log(`Processing ${pendingDocs.length} pending ${collection} creations...`);
+      
+      const processedDocs = [];
+      const offlineIdMap = new Map(); // Maps offline IDs to server IDs
+      
+      for (const pendingDoc of pendingDocs) {
         try {
-          // Check if the file still exists
-          const fileExists = await RNFS.exists(upload.localUri.replace('file://', ''));
-          
-          if (!fileExists) {
-            console.warn('Pending upload file no longer exists:', upload.localUri);
+          // Skip invalid entries
+          if (!pendingDoc || !pendingDoc.data) {
+            processedDocs.push(pendingDoc);
             continue;
           }
           
-          // Upload the file
-          const downloadUrl = await this.uploadToStorage(
-            upload.localUri, 
-            upload.storagePath, 
-            upload.metadata
-          );
+          const docData = { ...pendingDoc.data };
           
-          // Call the completion handler if provided
-          if (upload.completionPath) {
-            const [collection, docId, field] = upload.completionPath.split('/');
-            
-            if (collection && docId && field) {
-              await this.firestore()
-                .collection(collection)
-                .doc(docId)
-                .update({
-                  [field]: downloadUrl,
-                  [`${field}Uploaded`]: true,
-                  lastUpdated: firestore.FieldValue.serverTimestamp()
-                });
-            }
+          // Add timestamps if not present
+          if (!docData.createdAt) {
+            docData.createdAt = pendingDoc.timestamp 
+              ? firestore.Timestamp.fromMillis(pendingDoc.timestamp)
+              : firestore.FieldValue.serverTimestamp();
           }
-        } catch (error) {
-          console.error('Error processing pending upload:', error);
-        }
-      }
-      
-      // Clear processed uploads
-      await AsyncStorage.setItem('pendingUploads', JSON.stringify([]));
-      
-    } catch (error) {
-      console.error('Error in processPendingUploads:', error);
-    }
-  }
-
-  /**
-   * Check if network is connected
-   * 
-   * @returns {Promise<boolean>} Whether network is connected
-   */
-  async checkConnection() {
-    try {
-      const state = await NetInfo.fetch();
-      this.isConnected = state.isConnected;
-      return state.isConnected;
-    } catch (error) {
-      console.error('Error checking network connection:', error);
-      return this.isConnected; // Use cached value
-    }
-  }
-
-  /**
-   * Get the current authenticated user
-   * 
-   * @returns {Object|null} Current Firebase user or null
-   */
-  getCurrentUser() {
-    return this.auth().currentUser;
-  }
-
-  /**
-   * Get user data from Firestore
-   * 
-   * @param {string} userId - User ID
-   * @param {boolean} forceRefresh - Whether to bypass cache
-   * @returns {Promise<Object>} User data
-   */
-  async getUserData(userId, forceRefresh = false) {
-    try {
-      if (!userId) {
-        throw new Error('User ID is required');
-      }
-      
-      // First check local cache for faster response (if not forcing refresh)
-      if (!forceRefresh) {
-        const cachedData = await AsyncStorage.getItem(`user_${userId}`);
-        let userData = null;
-        
-        if (cachedData) {
-          try {
-            userData = JSON.parse(cachedData);
-            // If we have recent cached data, return it immediately
-            const cacheTime = userData._cachedAt || 0;
-            const cacheAge = Date.now() - cacheTime;
-            
-            // Use cache if less than 30 minutes old and not forcing refresh
-            if (cacheAge < 30 * 60 * 1000) {
-              return userData;
-            }
-          } catch (parseError) {
-            console.error('Error parsing cached user data:', parseError);
-          }
-        }
-      }
-      
-      // Check network connectivity
-      if (!(await this.checkConnection())) {
-        const cachedData = await AsyncStorage.getItem(`user_${userId}`);
-        if (cachedData) {
-          // Return cached data if available but mark it as potentially stale
-          try {
-            const userData = JSON.parse(cachedData);
-            return {
-              ...userData,
-              _fromCache: true
-            };
-          } catch (parseError) {
-            console.error('Error parsing cached user data:', parseError);
-          }
-        }
-        throw new Error('No internet connection. Please try again when online.');
-      }
-      
-      // Fetch fresh data from Firestore
-      const docRef = await this.firestore().collection('users').doc(userId).get();
-      
-      if (!docRef.exists) {
-        throw new Error('User not found');
-      }
-      
-      // Process the data
-      const freshData = {
-        id: docRef.id,
-        ...docRef.data(),
-        // Convert Firestore timestamps to JS Dates
-        joinDate: docRef.data().joinDate?.toDate() || null,
-        lastUpdated: docRef.data().lastUpdated?.toDate() || null,
-        lastActive: docRef.data().lastActive?.toDate() || null,
-        _cachedAt: Date.now()
-      };
-      
-      // Update the cache
-      await AsyncStorage.setItem(`user_${userId}`, JSON.stringify(freshData));
-      
-      return freshData;
-    } catch (error) {
-      console.error('Error getting user data:', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Create or update user document in Firestore
-   * 
-   * @param {string} userId - User ID
-   * @param {Object} userData - User data to save
-   * @param {boolean} merge - Whether to merge with existing data
-   * @returns {Promise<boolean>} Success status
-   */
-  async setUserData(userId, userData, merge = true) {
-    try {
-      if (!userId) {
-        throw new Error('User ID is required');
-      }
-
-      if (!userData || typeof userData !== 'object') {
-        throw new Error('User data must be an object');
-      }
-      
-      // Check network connectivity
-      if (!(await this.checkConnection())) {
-        // Queue operation for later execution
-        this.offlineQueue.push({
-          execute: async () => this.setUserData(userId, userData, merge),
-          type: 'setUserData',
-          data: { userId, userData, merge },
-          timestamp: Date.now()
-        });
-        
-        // Save in local storage for offline cache
-        await AsyncStorage.setItem(`user_${userId}_pending`, JSON.stringify({
-          userData,
-          merge,
-          timestamp: Date.now()
-        }));
-        
-        throw new Error('No internet connection. Changes will be applied when you are back online.');
-      }
-      
-      // Sanitize data before saving
-      const sanitizedData = {};
-      
-      for (const [key, value] of Object.entries(userData)) {
-        // Sanitize strings to prevent XSS
-        if (typeof value === 'string') {
-          sanitizedData[key] = sanitizeInput(value);
-        } else {
-          sanitizedData[key] = value;
-        }
-      }
-      
-      // Add timestamp if creating new document
-      if (!merge) {
-        sanitizedData.joinDate = firestore.FieldValue.serverTimestamp();
-        sanitizedData.lastUpdated = firestore.FieldValue.serverTimestamp();
-      } else {
-        sanitizedData.lastUpdated = firestore.FieldValue.serverTimestamp();
-      }
-      
-      // Update Firestore
-      await this.firestore()
-        .collection('users')
-        .doc(userId)
-        .set(sanitizedData, { merge });
-        
-      // Update local cache
-      try {
-        let cachedData;
-        if (merge) {
-          const existingData = await AsyncStorage.getItem(`user_${userId}`);
-          cachedData = existingData ? { ...JSON.parse(existingData), ...sanitizedData } : sanitizedData;
-        } else {
-          cachedData = sanitizedData;
-        }
-        
-        cachedData._cachedAt = Date.now();
-        
-        await AsyncStorage.setItem(`user_${userId}`, JSON.stringify(cachedData));
-        
-        // Clear any pending changes
-        await AsyncStorage.removeItem(`user_${userId}_pending`);
-      } catch (cacheError) {
-        console.error('Error updating user cache:', cacheError);
-        // Non-critical error, continue
-      }
-      
-      return true;
-    } catch (error) {
-      console.error('Error setting user data:', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Update user profile data in Firestore
-   * 
-   * @param {string} userId - User ID
-   * @param {Object} updates - Data to update
-   * @returns {Promise<boolean>} Success status
-   */
-  async updateUserProfile(userId, updates) {
-    try {
-      if (!userId) {
-        throw new Error('User ID is required');
-      }
-
-      if (!updates || typeof updates !== 'object') {
-        throw new Error('Updates must be an object');
-      }
-      
-      // Check network connectivity
-      if (!(await this.checkConnection())) {
-        // Queue operation for later
-        this.offlineQueue.push({
-          execute: async () => this.updateUserProfile(userId, updates),
-          type: 'updateUserProfile',
-          data: { userId, updates },
-          timestamp: Date.now()
-        });
-        
-        // Store pending updates
-        try {
-          const pendingUpdates = JSON.parse(await AsyncStorage.getItem(`user_${userId}_pendingUpdates`) || '{}');
-          const mergedUpdates = { ...pendingUpdates, ...updates, _pendingAt: Date.now() };
-          await AsyncStorage.setItem(`user_${userId}_pendingUpdates`, JSON.stringify(mergedUpdates));
           
-          // Update local cache optimistically
-          const cachedData = JSON.parse(await AsyncStorage.getItem(`user_${userId}`) || '{}');
-          const updatedCache = { ...cachedData, ...updates, _hasPendingUpdates: true };
-          await AsyncStorage.setItem(`user_${userId}`, JSON.stringify(updatedCache));
-        } catch (storageError) {
-          console.error('Error storing pending updates:', storageError);
-        }
-        
-        return true; // Return success for optimistic UI updates
-      }
-      
-      const sanitizedUpdates = {};
-      
-      // Sanitize input data
-      for (const [key, value] of Object.entries(updates)) {
-        if (typeof value === 'string') {
-          sanitizedUpdates[key] = sanitizeInput(value);
-        } else {
-          sanitizedUpdates[key] = value;
-        }
-      }
-      
-      // Add last updated timestamp
-      sanitizedUpdates.lastUpdated = firestore.FieldValue.serverTimestamp();
-      
-      // Update Firestore
-      await this.firestore()
-        .collection('users')
-        .doc(userId)
-        .update(sanitizedUpdates);
-        
-      // Update local cache
-      try {
-        const cachedData = JSON.parse(await AsyncStorage.getItem(`user_${userId}`) || '{}');
-        const updatedCache = { ...cachedData, ...sanitizedUpdates, _cachedAt: Date.now() };
-        delete updatedCache._hasPendingUpdates;
-        
-        await AsyncStorage.setItem(`user_${userId}`, JSON.stringify(updatedCache));
-        await AsyncStorage.removeItem(`user_${userId}_pendingUpdates`);
-      } catch (cacheError) {
-        console.error('Error updating cache after profile update:', cacheError);
-        // Non-critical error, continue
-      }
-      
-      return true;
-    } catch (error) {
-      console.error('Error updating user profile:', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Sign in user with email and password
-   * 
-   * @param {string} email - User email
-   * @param {string} password - User password
-   * @returns {Promise<Object>} User credential
-   */
-  async signIn(email, password) {
-    try {
-      if (!email || !password) {
-        throw new Error('Email and password are required');
-      }
-      
-      // Check network connectivity
-      if (!(await this.checkConnection())) {
-        throw new Error('No internet connection. Please try again when online.');
-      }
-      
-      const result = await this.auth().signInWithEmailAndPassword(email, password);
-      
-      // Create audit log
-      try {
-        await this.securityUtils.createAuditLog(
-          result.user.uid,
-          'sign_in',
-          { platform: Platform.OS }
-        );
-      } catch (auditError) {
-        console.error('Error creating sign-in audit log:', auditError);
-        // Non-critical, continue
-      }
-      
-      // Update user's last login time
-      try {
-        await this.updateUserProfile(result.user.uid, {
-          lastLoginAt: firestore.FieldValue.serverTimestamp()
-        });
-      } catch (updateError) {
-        console.error('Error updating last login time:', updateError);
-        // Non-critical, continue
-      }
-      
-      return result;
-    } catch (error) {
-      console.error('Sign in error:', error);
-      
-      // Get user-friendly error message
-      const errorMessage = getAuthErrorMessage(error, 'login');
-      throw new Error(errorMessage);
-    }
-  }
-
-  /**
-   * Create a new user account
-   * 
-   * @param {string} email - User email
-   * @param {string} password - User password
-   * @param {Object} profileData - Additional profile data
-   * @returns {Promise<Object>} User credential
-   */
-  async signUp(email, password, profileData = {}) {
-    try {
-      if (!email || !password) {
-        throw new Error('Email and password are required');
-      }
-      
-      // Check network connectivity
-      if (!(await this.checkConnection())) {
-        throw new Error('No internet connection. Please try again when online.');
-      }
-      
-      // Check for disposable email 
-      if (this.securityUtils.isDisposableEmail(email)) {
-        throw new Error('Please use a non-disposable email address');
-      }
-
-      // Create user account
-      const userCredential = await this.auth().createUserWithEmailAndPassword(email, password);
-      
-      try {
-        // Create user document in Firestore
-        await this.setUserData(userCredential.user.uid, {
-          email,
-          ...profileData,
-          isNewUser: true,
-          emailVerified: userCredential.user.emailVerified || false,
-          medicalConditions: profileData.medicalConditions || [],
-          role: 'user',
-          status: 'active',
-          createdAt: firestore.FieldValue.serverTimestamp(),
-          lastLoginAt: firestore.FieldValue.serverTimestamp()
-        }, false);
-      } catch (profileError) {
-        console.error('Error creating user profile:', profileError);
-        
-        // If profile creation fails but account was created,
-        // we'll try to at least set minimal data
-        try {
-          await this.setUserData(userCredential.user.uid, {
-            email,
-            isNewUser: true,
-            emailVerified: false,
-            role: 'user',
-            status: 'active'
-          }, false);
-        } catch (fallbackError) {
-          console.error('Error creating minimal user profile:', fallbackError);
-          // Continue with user creation even if profile creation fails
-        }
-      }
-      
-      // Create audit log
-      try {
-        await this.securityUtils.createAuditLog(
-          userCredential.user.uid,
-          'account_created',
-          { email, platform: Platform.OS }
-        );
-      } catch (auditError) {
-        console.error('Error creating audit log:', auditError);
-        // Non-critical, continue
-      }
-      
-      return userCredential;
-    } catch (error) {
-      console.error('Sign up error:', error);
-      
-      // Get user-friendly error message
-      const errorMessage = getAuthErrorMessage(error, 'registration');
-      throw new Error(errorMessage);
-    }
-  }
-
-  /**
-   * Sign out the current user
-   * 
-   * @returns {Promise<boolean>} Success status
-   */
-  async signOut() {
-    try {
-      // Check network connectivity - we allow signout even if offline
-      const isConnected = await this.checkConnection();
-      
-      // Get user ID before signing out for audit log
-      const userId = this.getCurrentUser()?.uid;
-      
-      // Clear FCM token if needed and if online
-      if (isConnected && userId) {
-        try {
-          const fcmToken = await AsyncStorage.getItem('fcmToken');
-          if (fcmToken) {
-            await this.firestore().collection('users').doc(userId).update({
-              fcmTokens: firestore.FieldValue.arrayRemove(fcmToken)
-            });
-          }
-        } catch (tokenError) {
-          console.error('Error clearing FCM token:', tokenError);
-          // Continue sign out process even if token removal fails
-        }
-      }
-      
-      // Update last active timestamp if online
-      if (isConnected && userId) {
-        try {
-          await this.firestore().collection('users').doc(userId).update({
-            lastActive: firestore.FieldValue.serverTimestamp()
-          });
-        } catch (updateError) {
-          console.error('Error updating last active timestamp:', updateError);
-          // Continue signing out
-        }
-      }
-      
-      // Sign out
-      await this.auth().signOut();
-      
-      // Create audit log if online
-      if (isConnected && userId) {
-        try {
-          await this.securityUtils.createAuditLog(
-            userId,
-            'sign_out',
-            { platform: Platform.OS }
-          );
-        } catch (auditError) {
-          console.error('Error creating audit log:', auditError);
-          // Non-critical, continue
-        }
-      }
-      
-      // Clear sensitive cached data
-      try {
-        const userKeys = await AsyncStorage.getAllKeys();
-        const keysToRemove = userKeys.filter(key => 
-          key.startsWith('user_') || 
-          key === 'fcmToken' ||
-          key === 'authState'
-        );
-        
-        if (keysToRemove.length > 0) {
-          await AsyncStorage.multiRemove(keysToRemove);
-        }
-      } catch (clearError) {
-        console.error('Error clearing cached data during sign out:', clearError);
-      }
-      
-      return true;
-    } catch (error) {
-      console.error('Sign out error:', error);
-      throw new Error('Failed to sign out. Please try again.');
-    }
-  }
-  
-  /**
-   * Reset user password
-   * 
-   * @param {string} email - User email
-   * @returns {Promise<boolean>} Success status
-   */
-  async resetPassword(email) {
-    try {
-      if (!email) {
-        throw new Error('Email is required');
-      }
-      
-      // Check network connectivity
-      if (!(await this.checkConnection())) {
-        throw new Error('No internet connection. Please try again when online.');
-      }
-      
-      await this.auth().sendPasswordResetEmail(email);
-      
-      // Log password reset attempt for security monitoring
-      try {
-        // Note: we don't have a user ID here, so we'll use email
-        await firestore().collection('securityEvents').add({
-          event: 'password_reset_requested',
-          email: email,
-          timestamp: firestore.FieldValue.serverTimestamp(),
-          platform: Platform.OS,
-          ipAddress: 'client-side' // Real IP should be captured server-side
-        });
-      } catch (logError) {
-        console.error('Error logging password reset attempt:', logError);
-        // Non-critical, continue
-      }
-      
-      return true;
-    } catch (error) {
-      console.error('Reset password error:', error);
-      
-      // Get user-friendly error message
-      const errorMessage = getAuthErrorMessage(error, 'reset');
-      throw new Error(errorMessage);
-    }
-  }
-
-  /**
-   * Upload a file to Firebase Storage
-   * 
-   * @param {string} uri - Local file URI
-   * @param {string} path - Storage path
-   * @param {Object} metadata - Optional metadata
-   * @param {Function} onProgress - Progress callback
-   * @returns {Promise<string>} Download URL
-   */
-  async uploadToStorage(uri, path, metadata = {}, onProgress = null) {
-    try {
-      if (!uri) {
-        throw new Error('File URI is required');
-      }
-      
-      if (!path) {
-        throw new Error('Storage path is required');
-      }
-      
-      // Check network connectivity
-      if (!(await this.checkConnection())) {
-        // Queue for later upload
-        try {
-          const pendingUploads = JSON.parse(await AsyncStorage.getItem('pendingUploads') || '[]');
+          docData.updatedAt = firestore.FieldValue.serverTimestamp();
+          docData.syncedFromOffline = true;
           
-          const uploadInfo = {
-            localUri: uri,
-            storagePath: path,
-            metadata,
-            timestamp: Date.now()
-          };
-          
-          pendingUploads.push(uploadInfo);
-          await AsyncStorage.setItem('pendingUploads', JSON.stringify(pendingUploads));
-        } catch (storageError) {
-          console.error('Error storing pending upload:', storageError);
-        }
-        
-        throw new Error('No internet connection. File will be uploaded when online.');
-      }
-      
-      // Ensure URI is properly formatted
-      let filePath = uri;
-      if (Platform.OS === 'ios' && !uri.startsWith('file://')) {
-        filePath = `file://${uri}`;
-      } else if (Platform.OS === 'android' && uri.startsWith('file://')) {
-        filePath = uri.substring(7);
-      }
-      
-      // Check if file exists
-      try {
-        const exists = await RNFS.exists(
-          Platform.OS === 'ios' ? filePath.replace('file://', '') : filePath
-        );
-        
-        if (!exists) {
-          throw new Error('File does not exist');
-        }
-      } catch (fileCheckError) {
-        console.error('Error checking file existence:', fileCheckError);
-        throw new Error('Unable to access the file. Please try again.');
-      }
-      
-      const reference = this.storage().ref(path);
-      
-      // Create upload task
-      const task = reference.putFile(filePath, metadata);
-      
-      // Monitor progress if callback provided
-      if (onProgress && typeof onProgress === 'function') {
-        task.on('state_changed', snapshot => {
-          const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
-          onProgress(progress);
-        });
-      }
-      
-      // Wait for upload to complete
-      await task;
-      
-      // Get download URL
-      const url = await reference.getDownloadURL();
-      
-      return url;
-    } catch (error) {
-      console.error('Upload to storage error:', error);
-      const errorMessage = getStorageErrorMessage(error, 'upload');
-      throw new Error(errorMessage);
-    }
-  }
-
-  /**
-   * Upload an image to Firebase Storage
-   * 
-   * @param {string} uri - Local image URI
-   * @param {string} path - Storage path
-   * @param {Object} metadata - Optional metadata
-   * @param {Function} onProgress - Progress callback
-   * @returns {Promise<string>} Download URL
-   */
-  async uploadImage(uri, path, metadata = {}, onProgress = null) {
-    // Determine image mime type from URI or extension
-    let contentType = metadata.contentType || 'image/jpeg';
-    
-    if (uri) {
-      const extension = uri.split('.').pop().toLowerCase();
-      if (extension === 'png') {
-        contentType = 'image/png';
-      } else if (extension === 'gif') {
-        contentType = 'image/gif';
-      } else if (extension === 'webp') {
-        contentType = 'image/webp';
-      } else if (extension === 'heic' || extension === 'heif') {
-        contentType = 'image/heic';
-      }
-    }
-    
-    const imageMetadata = { 
-      contentType,
-      ...metadata
-    };
-    
-    return this.uploadToStorage(uri, path, imageMetadata, onProgress);
-  }
-
-  /**
-   * Upload a profile image
-   * 
-   * @param {string} uri - Local image URI
-   * @param {string} userId - User ID
-   * @param {Function} onProgress - Progress callback
-   * @returns {Promise<string>} Download URL
-   */
-  async uploadProfileImage(uri, userId, onProgress = null) {
-    try {
-      if (!uri) {
-        throw new Error('Image URI is required');
-      }
-      
-      if (!userId) {
-        throw new Error('User ID is required');
-      }
-      
-      const extension = uri.split('.').pop().toLowerCase() || 'jpg';
-      const path = `profiles/${userId}_${Date.now()}.${extension}`;
-      
-      // Get content type based on extension
-      let contentType = 'image/jpeg';
-      if (extension === 'png') {
-        contentType = 'image/png';
-      } else if (extension === 'gif') {
-        contentType = 'image/gif';
-      } else if (extension === 'webp') {
-        contentType = 'image/webp';
-      } else if (extension === 'heic' || extension === 'heif') {
-        contentType = 'image/heic';
-      }
-      
-      const url = await this.uploadImage(
-        uri, 
-        path, 
-        { contentType }, 
-        onProgress
-      );
-      
-      // Update user profile with new image URL
-      if (url) {
-        try {
-          // Get current profile data
-          const userDoc = await this.firestore().collection('users').doc(userId).get();
-          
-          if (userDoc.exists) {
-            const userData = userDoc.data();
-            const oldImagePath = userData.profileImagePath;
-            
-            // Update profile with new image URL
-            await this.updateUserProfile(userId, {
-              profileImageURL: url,
-              profileImagePath: path
-            });
-            
-            // Attempt to delete old profile image if it exists
-            if (oldImagePath) {
-              try {
-                const oldImageRef = this.storage().ref(oldImagePath);
-                await oldImageRef.delete();
-              } catch (deleteError) {
-                console.error('Error deleting old profile image:', deleteError);
-                // Non-critical, continue
-              }
-            }
+          // Create the document
+          let docRef;
+          if (pendingDoc.id && !pendingDoc.id.startsWith('offline_')) {
+            docRef = this.firestore().collection(collection).doc(pendingDoc.id);
+            await docRef.set(docData);
           } else {
-            // If user document doesn't exist, just update with the image
-            await this.updateUserProfile(userId, {
-              profileImageURL: url,
-              profileImagePath: path
-            });
+            docRef = await this.firestore().collection(collection).add(docData);
+            
+            // Store mapping from offline ID to real ID
+            if (pendingDoc.id && pendingDoc.id.startsWith('offline_')) {
+              offlineIdMap.set(pendingDoc.id, docRef.id);
+            }
           }
-        } catch (updateError) {
-          console.error('Error updating profile with new image:', updateError);
-          // Continue - the image was uploaded successfully
+          
+          processedDocs.push(pendingDoc);
+        } catch (error) {
+          console.error(`Error creating ${collection} document:`, error);
+          // Keep failed docs in the pending list
         }
       }
       
-      return url;
-    } catch (error) {
-      console.error('Upload profile image error:', error);
-      throw error;
-    }
-  }
-  
-  /**
-   * Upload a video to Firebase Storage
-   * 
-   * @param {string} uri - Local video URI
-   * @param {string} thumbnailUri - Thumbnail URI for video
-   * @param {string} path - Storage path
-   * @param {Object} metadata - Optional metadata
-   * @param {Function} onProgress - Progress callback
-   * @returns {Promise<Object>} Object with download URL and thumbnail URL
-   */
-  async uploadVideo(uri, thumbnailUri, path, metadata = {}, onProgress = null) {
-    try {
-      if (!uri) {
-        throw new Error('Video URI is required');
-      }
-      
-      if (!path) {
-        throw new Error('Storage path is required');
-      }
-      
-      // Upload video file
-      const videoUrl = await this.uploadToStorage(
-        uri,
-        path,
-        { contentType: 'video/mp4', ...metadata },
-        onProgress
+      // Remove processed docs from pending list
+      const remainingDocs = pendingDocs.filter(doc => 
+        !processedDocs.some(processed => processed.id === doc.id)
       );
       
-      let thumbnailUrl = null;
+      await AsyncStorage.setItem(`pending_${collection}`, JSON.stringify(remainingDocs));
       
-      // Upload thumbnail if provided
-      if (thumbnailUri) {
+      // Store offline ID mapping for conflict resolution
+      if (offlineIdMap.size > 0) {
         try {
-          const thumbPath = `${path.split('.')[0]}_thumb.jpg`;
-          thumbnailUrl = await this.uploadImage(
-            thumbnailUri,
-            thumbPath,
-            { contentType: 'image/jpeg' }
-          );
-        } catch (thumbError) {
-          console.error('Error uploading video thumbnail:', thumbError);
-          // Continue without thumbnail
-        }
-      }
-      
-      return {
-        videoUrl,
-        thumbnailUrl
-      };
-    } catch (error) {
-      console.error('Upload video error:', error);
-      const errorMessage = getStorageErrorMessage(error, 'upload');
-      throw new Error(errorMessage);
-    }
-  }
-  
-  /**
-   * Delete a file from Firebase Storage
-   * 
-   * @param {string} path - Storage path of the file
-   * @returns {Promise<boolean>} Success status
-   */
-  async deleteFile(path) {
-    try {
-      if (!path) {
-        throw new Error('Storage path is required');
-      }
-      
-      // Check network connectivity
-      if (!(await this.checkConnection())) {
-        // Queue for later deletion
-        this.offlineQueue.push({
-          execute: async () => this.deleteFile(path),
-          type: 'deleteFile',
-          data: { path },
-          timestamp: Date.now()
-        });
-        
-        throw new Error('No internet connection. File will be deleted when online.');
-      }
-      
-      const reference = this.storage().ref(path);
-      await reference.delete();
-      
-      return true;
-    } catch (error) {
-      // If file doesn't exist, consider deletion successful
-      if (error.code === 'storage/object-not-found') {
-        return true;
-      }
-      
-      console.error('Delete file error:', error);
-      const errorMessage = getStorageErrorMessage(error, 'delete');
-      throw new Error(errorMessage);
-    }
-  }
-  
-  /**
-   * Create a new document in a collection
-   * 
-   * @param {string} collection - Collection name
-   * @param {Object} data - Document data
-   * @param {string} docId - Optional document ID
-   * @returns {Promise<string>} Document ID
-   */
-  async createDocument(collection, data, docId = null) {
-    try {
-      if (!collection) {
-        throw new Error('Collection name is required');
-      }
-      
-      if (!data || typeof data !== 'object') {
-        throw new Error('Document data must be an object');
-      }
-      
-      // Check network connectivity
-      if (!(await this.checkConnection())) {
-        // Store for offline sync
-        const offlineId = docId || `offline_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
-        
-        this.offlineQueue.push({
-          execute: async () => this.createDocument(collection, data, docId),
-          type: 'createDocument',
-          data: { collection, data, docId },
-          timestamp: Date.now()
-        });
-        
-        // Store in local storage for offline operation
-        try {
-          const pendingDocs = JSON.parse(await AsyncStorage.getItem(`pending_${collection}`) || '[]');
-          pendingDocs.push({
-            id: offlineId,
-            data,
-            timestamp: Date.now()
-          });
-          await AsyncStorage.setItem(`pending_${collection}`, JSON.stringify(pendingDocs));
-        } catch (storageError) {
-          console.error('Error storing pending document:', storageError);
-        }
-        
-        return offlineId; // Return a temporary ID for optimistic UI updates
-      }
-      
-      // Sanitize data
-      const sanitizedData = {};
-      for (const [key, value] of Object.entries(data)) {
-        if (typeof value === 'string') {
-          sanitizedData[key] = sanitizeInput(value);
-        } else {
-          sanitizedData[key] = value;
-        }
-      }
-      
-      // Add timestamps
-      sanitizedData.createdAt = firestore.FieldValue.serverTimestamp();
-      sanitizedData.updatedAt = firestore.FieldValue.serverTimestamp();
-      
-      // Add the document to Firestore
-      let docRef;
-      if (docId) {
-        docRef = this.firestore().collection(collection).doc(docId);
-        await docRef.set(sanitizedData);
-      } else {
-        docRef = await this.firestore().collection(collection).add(sanitizedData);
-      }
-      
-      return docRef.id;
-    } catch (error) {
-      console.error('Create document error:', error);
-      const errorMessage = getFirestoreErrorMessage(error, collection);
-      throw new Error(errorMessage);
-    }
-  }
-  
-  /**
-   * Update a document in a collection
-   * 
-   * @param {string} collection - Collection name
-   * @param {string} docId - Document ID
-   * @param {Object} data - Document data to update
-   * @returns {Promise<boolean>} Success status
-   */
-  async updateDocument(collection, docId, data) {
-    try {
-      if (!collection || !docId) {
-        throw new Error('Collection name and document ID are required');
-      }
-      
-      if (!data || typeof data !== 'object') {
-        throw new Error('Update data must be an object');
-      }
-      
-      // Check network connectivity
-      if (!(await this.checkConnection())) {
-        this.offlineQueue.push({
-          execute: async () => this.updateDocument(collection, docId, data),
-          type: 'updateDocument',
-          data: { collection, docId, data },
-          timestamp: Date.now()
-        });
-        
-        // Store in local storage for offline operation
-        try {
-          const pendingUpdates = JSON.parse(
-            await AsyncStorage.getItem(`pending_updates_${collection}`) || '{}'
-          );
+          const existingMap = JSON.parse(await AsyncStorage.getItem('offlineIdMap') || '{}');
+          const updatedMap = { ...existingMap };
           
-          pendingUpdates[docId] = {
-            ...pendingUpdates[docId],
-            ...data,
-            timestamp: Date.now()
+          offlineIdMap.forEach((serverId, offlineId) => {
+            updatedMap[offlineId] = serverId;
+          });
+          
+          await AsyncStorage.setItem('offlineIdMap', JSON.stringify(updatedMap));
+        } catch (mapError) {
+          console.error('Error storing offline ID map:', mapError);
+        }
+      }
+      
+      console.log(`Processed ${processedDocs.length} pending ${collection} creations`);
+    } catch (error) {
+      console.error(`Error processing pending ${collection} creations:`, error);
+    }
+  }
+  
+  /**
+   * Process pending document updates for a collection
+   * @param {string} collection - Collection name
+   */
+  async processPendingUpdates(collection) {
+    try {
+      const pendingUpdates = JSON.parse(await AsyncStorage.getItem(`pending_updates_${collection}`) || '{}');
+      const docIds = Object.keys(pendingUpdates);
+      
+      if (docIds.length === 0) return;
+      
+      console.log(`Processing ${docIds.length} pending ${collection} updates...`);
+      
+      // Get offline ID mapping for conflict resolution
+      const offlineIdMap = JSON.parse(await AsyncStorage.getItem('offlineIdMap') || '{}');
+      const processedIds = [];
+      
+      for (const docId of docIds) {
+        try {
+          const updates = pendingUpdates[docId];
+          if (!updates) continue;
+          
+          // If this is an offline ID, get the real server ID
+          let realDocId = docId;
+          if (docId.startsWith('offline_') && offlineIdMap[docId]) {
+            realDocId = offlineIdMap[docId];
+          }
+          
+          // Add timestamp and offline flag
+          const docUpdates = {
+            ...updates,
+            updatedAt: firestore.FieldValue.serverTimestamp(),
+            syncedFromOffline: true
           };
           
-          await AsyncStorage.setItem(`pending_updates_${collection}`, JSON.stringify(pendingUpdates));
-        } catch (storageError) {
-          console.error('Error storing pending update:', storageError);
-        }
-        
-        return true; // Optimistic update
-      }
-      
-      // Sanitize data
-      const sanitizedData = {};
-      for (const [key, value] of Object.entries(data)) {
-        if (typeof value === 'string') {
-          sanitizedData[key] = sanitizeInput(value);
-        } else {
-          sanitizedData[key] = value;
+          delete docUpdates.timestamp;
+          delete docUpdates._pendingAt;
+          
+          // Update the document
+          const docRef = this.firestore().collection(collection).doc(realDocId);
+          await docRef.update(docUpdates);
+          
+          processedIds.push(docId);
+        } catch (error) {
+          console.error(`Error updating ${collection} document:`, error);
+          // Keep failed updates in the pending list
         }
       }
       
-      // Add timestamp
-      sanitizedData.updatedAt = firestore.FieldValue.serverTimestamp();
+      // Remove processed updates from pending list
+      const remainingUpdates = { ...pendingUpdates };
+      processedIds.forEach(id => {
+        delete remainingUpdates[id];
+      });
       
-      // Update the document
-      await this.firestore().collection(collection).doc(docId).update(sanitizedData);
-      
-      return true;
+      await AsyncStorage.setItem(`pending_updates_${collection}`, JSON.stringify(remainingUpdates));
+      console.log(`Processed ${processedIds.length} pending ${collection} updates`);
     } catch (error) {
-      console.error('Update document error:', error);
-      const errorMessage = getFirestoreErrorMessage(error, collection);
-      throw new Error(errorMessage);
+      console.error(`Error processing pending ${collection} updates:`, error);
     }
   }
   
   /**
-   * Get a document from a collection
-   * 
+   * Process pending document deletions for a collection
    * @param {string} collection - Collection name
-   * @param {string} docId - Document ID
-   * @returns {Promise<Object>} Document data
    */
-  async getDocument(collection, docId) {
+  async processPendingDeletions(collection) {
     try {
-      if (!collection || !docId) {
-        throw new Error('Collection name and document ID are required');
-      }
+      const pendingDeletions = JSON.parse(await AsyncStorage.getItem(`pending_deletions_${collection}`) || '[]');
       
-      // Check network connectivity
-      if (!(await this.checkConnection())) {
-        // Check local cache
+      if (pendingDeletions.length === 0) return;
+      
+      console.log(`Processing ${pendingDeletions.length} pending ${collection} deletions...`);
+      
+      // Get offline ID mapping for conflict resolution
+      const offlineIdMap = JSON.parse(await AsyncStorage.getItem('offlineIdMap') || '{}');
+      const processedIds = [];
+      
+      for (const deletion of pendingDeletions) {
         try {
-          const cachedDoc = await AsyncStorage.getItem(`${collection}_${docId}`);
-          if (cachedDoc) {
-            return {
-              ...JSON.parse(cachedDoc),
-              _fromCache: true
-            };
+          if (!deletion || !deletion.id) continue;
+          
+          // If this is an offline ID, get the real server ID or skip
+          let realDocId = deletion.id;
+          if (deletion.id.startsWith('offline_')) {
+            if (offlineIdMap[deletion.id]) {
+              realDocId = offlineIdMap[deletion.id];
+            } else {
+              // If no real ID exists, the document was never created on server
+              processedIds.push(deletion);
+              continue;
+            }
           }
-        } catch (cacheError) {
-          console.error('Error reading cached document:', cacheError);
-        }
-        
-        throw new Error('No internet connection and no cached version available.');
-      }
-      
-      const docRef = await this.firestore().collection(collection).doc(docId).get();
-      
-      if (!docRef.exists) {
-        throw new Error('Document not found');
-      }
-      
-      const docData = {
-        id: docRef.id,
-        ...docRef.data()
-      };
-      
-      // Convert Firestore timestamps to JS Dates
-      for (const [key, value] of Object.entries(docData)) {
-        if (value && typeof value.toDate === 'function') {
-          docData[key] = value.toDate();
+          
+          // Delete the document
+          await this.firestore().collection(collection).doc(realDocId).delete();
+          
+          processedIds.push(deletion);
+        } catch (error) {
+          // If document doesn't exist, consider deletion successful
+          if (error.code === 'firestore/not-found') {
+            processedIds.push(deletion);
+          } else {
+            console.error(`Error deleting ${collection} document:`, error);
+            // Keep failed deletions in the pending list
+          }
         }
       }
       
-      // Cache the document
-      try {
-        await AsyncStorage.setItem(`${collection}_${docId}`, JSON.stringify({
-          ...docData,
-          _cachedAt: Date.now()
-        }));
-      } catch (cacheError) {
-        console.error('Error caching document:', cacheError);
-        // Non-critical, continue
-      }
+      // Remove processed deletions from pending list
+      const remainingDeletions = pendingDeletions.filter(deletion => 
+        !processedIds.some(processed => processed.id === deletion.id)
+      );
       
-      return docData;
+      await AsyncStorage.setItem(`pending_deletions_${collection}`, JSON.stringify(remainingDeletions));
+      console.log(`Processed ${processedIds.length} pending ${collection} deletions`);
     } catch (error) {
-      console.error('Get document error:', error);
-      throw error;
+      console.error(`Error processing pending ${collection} deletions:`, error);
     }
   }
-  
+
   /**
-   * Delete a document from a collection
-   * 
-   * @param {string} collection - Collection name
-   * @param {string} docId - Document ID
+   * Process a single operation from the queue
+   * @param {Object} operation - The operation to process
    * @returns {Promise<boolean>} Success status
    */
-  async deleteDocument(collection, docId) {
+  async processOperation(operation) {
     try {
-      if (!collection || !docId) {
-        throw new Error('Collection name and document ID are required');
+      if (!operation || !operation.type || !operation.data) {
+        return false;
       }
       
-      // Check network connectivity
-      if (!(await this.checkConnection())) {
-        this.offlineQueue.push({
-          execute: async () => this.deleteDocument(collection, docId),
-          type: 'deleteDocument',
-          data: { collection, docId },
-          timestamp: Date.now()
-        });
-        
-        // Mark as pending deletion in local storage
-        try {
-          const pendingDeletions = JSON.parse(
-            await AsyncStorage.getItem(`pending_deletions_${collection}`) || '[]'
+      switch (operation.type) {
+        case 'setUserData':
+          await this.setUserData(
+            operation.data.userId,
+            operation.data.userData,
+            operation.data.merge,
+            true // skipQueue flag to prevent recursion
           );
+          return true;
           
-          pendingDeletions.push({
-            id: docId,
-            timestamp: Date.now()
-          });
+        case 'updateUserProfile':
+          await this.updateUserProfile(
+            operation.data.userId,
+            operation.data.updates,
+            true // skipQueue flag
+          );
+          return true;
           
-          await AsyncStorage.setItem(`pending_deletions_${collection}`, JSON.stringify(pendingDeletions));
+        case 'createDocument':
+          await this.createDocument(
+            operation.data.collection,
+            operation.data.data,
+            operation.data.docId,
+            true // skipQueue flag
+          );
+          return true;
           
-          // Remove from cache
-          await AsyncStorage.removeItem(`${collection}_${docId}`);
-        } catch (storageError) {
-          console.error('Error storing pending deletion:', storageError);
-        }
-        
-        return true; // Optimistic delete
+        case 'updateDocument':
+          await this.updateDocument(
+            operation.data.collection,
+            operation.data.docId,
+            operation.data.data,
+            true // skipQueue flag
+          );
+          return true;
+          
+        case 'deleteDocument':
+          await this.deleteDocument(
+            operation.data.collection,
+            operation.data.docId,
+            true // skipQueue flag
+          );
+          return true;
+          
+        case 'deleteFile':
+          await this.deleteFile(
+            operation.data.path,
+            true // skipQueue flag
+          );
+          return true;
+          
+        default:
+          console.warn(`Unknown operation type: ${operation.type}`);
+          return false;
       }
-      
-      // Delete from Firestore
-      await this.firestore().collection(collection).doc(docId).delete();
-      
-      // Remove from cache
-      await AsyncStorage.removeItem(`${collection}_${docId}`);
-      
-      return true;
     } catch (error) {
-      console.error('Delete document error:', error);
-      const errorMessage = getFirestoreErrorMessage(error, collection);
-      throw new Error(errorMessage);
+      console.error(`Error processing operation ${operation.type}:`, error);
+      return false;
     }
-  }
-
-  /**
-   * Clean up resources and listeners when no longer needed
-   */
-  cleanup() {
-    // Any cleanup that might be needed
-    // This method helps prevent memory leaks
-  }
-}
-
-// Export a singleton instance
-const firebaseUtils = new FirebaseUtils();
-export default firebaseUtils;
