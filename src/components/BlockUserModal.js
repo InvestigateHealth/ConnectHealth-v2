@@ -1,66 +1,158 @@
 // src/components/BlockUserModal.js
-// Modal component for blocking users
+// A reusable modal component for blocking users
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   View,
   Text,
   StyleSheet,
-  Modal,
   TouchableOpacity,
+  Modal,
+  TextInput,
   ActivityIndicator,
-  Alert
+  Keyboard,
+  AccessibilityInfo,
+  Platform
 } from 'react-native';
 import Icon from 'react-native-vector-icons/Ionicons';
-import { useUser } from '../contexts/UserContext';
 import { useTheme } from '../theme/ThemeContext';
+import { useUser } from '../contexts/UserContext';
+import * as Haptics from '../utils/haptics';
+import { AnalyticsService } from '../services/AnalyticsService';
 
 const BlockUserModal = ({ visible, onClose, userToBlock, onSuccess }) => {
   const { theme } = useTheme();
   const { blockUser } = useUser();
-  const [loading, setLoading] = useState(false);
-  const [blockReason, setBlockReason] = useState('');
   
-  // Reset state when modal is closed
-  React.useEffect(() => {
-    if (!visible) {
+  const [blockReason, setBlockReason] = useState('');
+  const [customReason, setCustomReason] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [keyboardVisible, setKeyboardVisible] = useState(false);
+  
+  // Reset state when modal opens/closes
+  useEffect(() => {
+    if (visible) {
       setBlockReason('');
+      setCustomReason('');
       setLoading(false);
     }
   }, [visible]);
   
-  // Get user display name
-  const displayName = userToBlock 
-    ? `${userToBlock.firstName || ''} ${userToBlock.lastName || ''}`.trim() || 'this user'
-    : 'this user';
+  // Handle keyboard showing/hiding
+  useEffect(() => {
+    const keyboardDidShowListener = Keyboard.addListener(
+      Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow',
+      () => setKeyboardVisible(true)
+    );
+    const keyboardDidHideListener = Keyboard.addListener(
+      Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide',
+      () => setKeyboardVisible(false)
+    );
+
+    return () => {
+      keyboardDidShowListener.remove();
+      keyboardDidHideListener.remove();
+    };
+  }, []);
+  
+  // Get user's display name
+  const getUserName = () => {
+    if (!userToBlock) return 'this user';
+    return `${userToBlock.firstName || ''} ${userToBlock.lastName || ''}`.trim() || 'this user';
+  };
   
   // Handle block submission
   const handleSubmitBlock = async () => {
-    if (loading || !userToBlock?.id) return;
+    if (!userToBlock || loading) return;
     
     try {
       setLoading(true);
+      Haptics.impactMedium();
       
-      const success = await blockUser(userToBlock.id, blockReason);
+      // Determine final reason based on selection
+      const finalReason = blockReason === 'Other' && customReason.trim() 
+        ? customReason.trim() 
+        : blockReason;
+      
+      // Call block user function
+      const success = await blockUser(userToBlock.id, finalReason);
       
       if (success) {
-        // Close modal first
-        onClose();
+        // Log analytics event
+        AnalyticsService.logEvent('block_user', { 
+          userId: userToBlock.id,
+          reason: finalReason
+        });
         
         // Call success callback
         if (onSuccess) {
           onSuccess();
         }
+        
+        // Close modal
+        onClose();
       } else {
         throw new Error('Failed to block user');
       }
     } catch (error) {
       console.error('Error blocking user:', error);
-      Alert.alert('Error', 'Failed to block user. Please try again.');
+      // Let consuming component handle the error
+      if (onSuccess) {
+        onSuccess(error);
+      }
     } finally {
       setLoading(false);
     }
   };
+  
+  // Announce modal for screen readers when it becomes visible
+  useEffect(() => {
+    if (visible) {
+      const message = `Block ${getUserName()} dialog opened`;
+      
+      if (Platform.OS === 'ios') {
+        AccessibilityInfo.announceForAccessibility(message);
+      } else {
+        // For Android
+        setTimeout(() => {
+          AccessibilityInfo.announceForAccessibility(message);
+        }, 500);
+      }
+    }
+  }, [visible, userToBlock]);
+  
+  // Select a reason option
+  const selectReasonOption = (reason) => {
+    setBlockReason(reason);
+    Haptics.selectionLight();
+  };
+  
+  // Render each reason option
+  const renderReasonOption = (reason, label) => (
+    <TouchableOpacity 
+      style={[
+        styles.reasonOption,
+        blockReason === reason && [
+          styles.selectedReasonOption,
+          { backgroundColor: theme.colors.primary.lightest }
+        ]
+      ]}
+      onPress={() => selectReasonOption(reason)}
+      accessible={true}
+      accessibilityLabel={label}
+      accessibilityRole="radio"
+      accessibilityState={{ checked: blockReason === reason }}
+    >
+      <Text style={[
+        styles.reasonText,
+        blockReason === reason && { color: theme.colors.primary.main }
+      ]}>
+        {label}
+      </Text>
+    </TouchableOpacity>
+  );
+  
+  if (!visible) return null;
   
   return (
     <Modal
@@ -72,16 +164,22 @@ const BlockUserModal = ({ visible, onClose, userToBlock, onSuccess }) => {
       <View style={styles.modalOverlay}>
         <View style={[
           styles.modalContainer,
-          { backgroundColor: theme.colors.background.paper }
+          { backgroundColor: theme.colors.background.paper },
+          keyboardVisible && styles.modalWithKeyboard
         ]}>
           <View style={styles.modalHeader}>
             <Text style={[
               styles.modalTitle,
               { color: theme.colors.text.primary }
             ]}>
-              Block {displayName}
+              Block {getUserName()}
             </Text>
-            <TouchableOpacity onPress={onClose} disabled={loading}>
+            <TouchableOpacity 
+              onPress={onClose}
+              accessible={true}
+              accessibilityLabel="Close"
+              accessibilityRole="button"
+            >
               <Icon name="close" size={24} color={theme.colors.text.secondary} />
             </TouchableOpacity>
           </View>
@@ -90,8 +188,8 @@ const BlockUserModal = ({ visible, onClose, userToBlock, onSuccess }) => {
             styles.modalDescription,
             { color: theme.colors.text.secondary }
           ]}>
-            When you block someone, they won't be able to follow you or view your posts.
-            They also won't be notified that you blocked them.
+            When you block someone, they won't be able to follow you, view your posts, or interact with you. 
+            They won't be notified that you blocked them.
           </Text>
           
           <Text style={[
@@ -102,90 +200,35 @@ const BlockUserModal = ({ visible, onClose, userToBlock, onSuccess }) => {
           </Text>
           
           <View style={styles.reasonOptions}>
-            <TouchableOpacity 
-              style={[
-                styles.reasonOption,
-                blockReason === 'Harassment' && [
-                  styles.selectedReasonOption,
-                  { backgroundColor: theme.colors.primary.lightest }
-                ],
-                { borderColor: theme.colors.divider }
-              ]}
-              onPress={() => setBlockReason('Harassment')}
-              disabled={loading}
-            >
-              <Text style={[
-                styles.reasonText,
-                blockReason === 'Harassment' && { color: theme.colors.primary.main },
-                { color: theme.colors.text.primary }
-              ]}>
-                Harassment
-              </Text>
-            </TouchableOpacity>
-            
-            <TouchableOpacity 
-              style={[
-                styles.reasonOption,
-                blockReason === 'Inappropriate Content' && [
-                  styles.selectedReasonOption,
-                  { backgroundColor: theme.colors.primary.lightest }
-                ],
-                { borderColor: theme.colors.divider }
-              ]}
-              onPress={() => setBlockReason('Inappropriate Content')}
-              disabled={loading}
-            >
-              <Text style={[
-                styles.reasonText,
-                blockReason === 'Inappropriate Content' && { color: theme.colors.primary.main },
-                { color: theme.colors.text.primary }
-              ]}>
-                Inappropriate Content
-              </Text>
-            </TouchableOpacity>
-            
-            <TouchableOpacity 
-              style={[
-                styles.reasonOption,
-                blockReason === 'Spam' && [
-                  styles.selectedReasonOption,
-                  { backgroundColor: theme.colors.primary.lightest }
-                ],
-                { borderColor: theme.colors.divider }
-              ]}
-              onPress={() => setBlockReason('Spam')}
-              disabled={loading}
-            >
-              <Text style={[
-                styles.reasonText,
-                blockReason === 'Spam' && { color: theme.colors.primary.main },
-                { color: theme.colors.text.primary }
-              ]}>
-                Spam
-              </Text>
-            </TouchableOpacity>
-            
-            <TouchableOpacity 
-              style={[
-                styles.reasonOption,
-                blockReason === 'Other' && [
-                  styles.selectedReasonOption,
-                  { backgroundColor: theme.colors.primary.lightest }
-                ],
-                { borderColor: theme.colors.divider }
-              ]}
-              onPress={() => setBlockReason('Other')}
-              disabled={loading}
-            >
-              <Text style={[
-                styles.reasonText,
-                blockReason === 'Other' && { color: theme.colors.primary.main },
-                { color: theme.colors.text.primary }
-              ]}>
-                Other
-              </Text>
-            </TouchableOpacity>
+            {renderReasonOption('Harassment', 'Harassment')}
+            {renderReasonOption('Inappropriate Content', 'Inappropriate Content')}
+            {renderReasonOption('Spam', 'Spam')}
+            {renderReasonOption('Misinformation', 'Misinformation')}
+            {renderReasonOption('Other', 'Other reason')}
           </View>
+          
+          {blockReason === 'Other' && (
+            <TextInput
+              style={[
+                styles.customReasonInput,
+                { 
+                  color: theme.colors.text.primary,
+                  backgroundColor: theme.colors.background.input,
+                  borderColor: theme.colors.divider 
+                }
+              ]}
+              placeholder="Please specify a reason..."
+              placeholderTextColor={theme.colors.text.hint}
+              value={customReason}
+              onChangeText={setCustomReason}
+              maxLength={100}
+              multiline
+              accessible={true}
+              accessibilityLabel="Custom reason for blocking"
+              accessibilityHint="Enter your own reason for blocking this user"
+              onSubmitEditing={Keyboard.dismiss}
+            />
+          )}
           
           <View style={styles.modalActions}>
             <TouchableOpacity 
@@ -195,6 +238,9 @@ const BlockUserModal = ({ visible, onClose, userToBlock, onSuccess }) => {
               ]}
               onPress={onClose}
               disabled={loading}
+              accessible={true}
+              accessibilityLabel="Cancel"
+              accessibilityRole="button"
             >
               <Text style={[
                 styles.cancelButtonText,
@@ -212,6 +258,9 @@ const BlockUserModal = ({ visible, onClose, userToBlock, onSuccess }) => {
               ]}
               onPress={handleSubmitBlock}
               disabled={loading}
+              accessible={true}
+              accessibilityLabel="Block User"
+              accessibilityRole="button"
             >
               {loading ? (
                 <ActivityIndicator size="small" color="white" />
@@ -247,6 +296,9 @@ const styles = StyleSheet.create({
     shadowRadius: 3.84,
     elevation: 5,
   },
+  modalWithKeyboard: {
+    marginBottom: 120, // Adjust when keyboard is visible
+  },
   modalHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -277,6 +329,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     borderRadius: 8,
     borderWidth: 1,
+    borderColor: 'rgba(0, 0, 0, 0.1)',
     margin: 4,
   },
   selectedReasonOption: {
@@ -284,6 +337,15 @@ const styles = StyleSheet.create({
   },
   reasonText: {
     fontSize: 14,
+  },
+  customReasonInput: {
+    height: 100,
+    borderWidth: 1,
+    borderRadius: 8,
+    padding: 12,
+    fontSize: 14,
+    textAlignVertical: 'top',
+    marginBottom: 20,
   },
   modalActions: {
     flexDirection: 'row',
