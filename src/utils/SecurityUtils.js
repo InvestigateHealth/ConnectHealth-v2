@@ -722,3 +722,7 @@ class SecurityUtils {
     }
   }
 }
+
+// Export a singleton instance for use throughout the app
+const securityUtils = new SecurityUtils();
+export default securityUtils;

@@ -30,7 +30,7 @@ const MB_IN_BYTES = 1024 * 1024;
  */
 export const processImage = async (imageData) => {
   try {
-    if (!imageData || !imageData.uri || !imageData.path) {
+    if (!imageData) {
       throw new Error('Invalid image data');
     }
 
@@ -40,17 +40,23 @@ export const processImage = async (imageData) => {
       throw new Error('No valid image path found');
     }
 
+    // Ensure we have the required properties
+    const imageWidth = imageData.width || 0;
+    const imageHeight = imageData.height || 0;
+    const imageSize = imageData.size || 0;
+    const imageMime = imageData.mime || 'image/jpeg';
+
     // Check if image needs resizing
     let needsResizing = false;
     let needsCompression = false;
     
     // Check dimensions
-    if (imageData.width > MAX_IMAGE_WIDTH || imageData.height > MAX_IMAGE_HEIGHT) {
+    if (imageWidth > MAX_IMAGE_WIDTH || imageHeight > MAX_IMAGE_HEIGHT) {
       needsResizing = true;
     }
     
     // Check file size
-    if (imageData.size > MAX_IMAGE_SIZE_MB * MB_IN_BYTES) {
+    if (imageSize > MAX_IMAGE_SIZE_MB * MB_IN_BYTES) {
       needsCompression = true;
     }
     
@@ -58,31 +64,31 @@ export const processImage = async (imageData) => {
     if (!needsResizing && !needsCompression) {
       return {
         uri: imagePath,
-        width: imageData.width,
-        height: imageData.height,
-        fileSize: imageData.size,
-        mime: imageData.mime || 'image/jpeg',
+        width: imageWidth,
+        height: imageHeight,
+        fileSize: imageSize,
+        mime: imageMime,
       };
     }
     
     // Get optimal dimensions while maintaining aspect ratio
-    const aspectRatio = imageData.width / imageData.height;
-    let targetWidth = imageData.width;
-    let targetHeight = imageData.height;
+    const aspectRatio = imageWidth / imageHeight;
+    let targetWidth = imageWidth;
+    let targetHeight = imageHeight;
     
     if (needsResizing) {
       if (aspectRatio >= 1) { // Landscape or square
-        targetWidth = Math.min(imageData.width, MAX_IMAGE_WIDTH);
+        targetWidth = Math.min(imageWidth, MAX_IMAGE_WIDTH);
         targetHeight = Math.round(targetWidth / aspectRatio);
       } else { // Portrait
-        targetHeight = Math.min(imageData.height, MAX_IMAGE_HEIGHT);
+        targetHeight = Math.min(imageHeight, MAX_IMAGE_HEIGHT);
         targetWidth = Math.round(targetHeight * aspectRatio);
       }
     }
     
     // Determine quality based on file size
     let quality = IMAGE_QUALITY;
-    if (needsCompression && imageData.size > 2 * MAX_IMAGE_SIZE_MB * MB_IN_BYTES) {
+    if (needsCompression && imageSize > 2 * MAX_IMAGE_SIZE_MB * MB_IN_BYTES) {
       quality = 60; // More aggressive compression for very large images
     } else if (needsCompression) {
       quality = 70; // Standard compression for large images
@@ -97,7 +103,7 @@ export const processImage = async (imageData) => {
       'image/heif': 'jpg', // Convert HEIF to JPEG
     };
     
-    const extension = mimeToExt[imageData.mime] || 'jpg';
+    const extension = mimeToExt[imageMime] || 'jpg';
     const outputFormat = extension === 'png' ? 'PNG' : 'JPEG';
     
     // Process the image
@@ -126,7 +132,17 @@ export const processImage = async (imageData) => {
   } catch (error) {
     console.error('Error processing image:', error);
     // Return original image if processing fails
-    return imageData;
+    if (imageData && (imageData.uri || imageData.path)) {
+      return {
+        uri: imageData.uri || imageData.path,
+        width: imageData.width || 0,
+        height: imageData.height || 0,
+        fileSize: imageData.size || 0,
+        mime: imageData.mime || 'image/jpeg',
+      };
+    }
+    // If we don't have valid image data, rethrow
+    throw error;
   }
 };
 
@@ -172,7 +188,7 @@ export const createImageThumbnail = async (imageUri) => {
  */
 export const processVideo = async (videoData) => {
   try {
-    if (!videoData || (!videoData.uri && !videoData.path)) {
+    if (!videoData) {
       throw new Error('Invalid video data');
     }
     
@@ -182,9 +198,10 @@ export const processVideo = async (videoData) => {
       throw new Error('No valid video path found');
     }
     
-    // Extract duration and size from videoData
+    // Extract duration and size from videoData, with defaults if missing
     const duration = videoData.duration || 0; // Duration in seconds
     const fileSize = videoData.size || 0; // Size in bytes
+    const videoMime = videoData.mime || 'video/mp4';
     
     // Check if video needs processing
     let needsProcessing = false;
@@ -205,7 +222,7 @@ export const processVideo = async (videoData) => {
         uri: videoUri,
         duration: duration,
         fileSize: fileSize,
-        mime: videoData.mime || 'video/mp4',
+        mime: videoMime,
       };
     }
     
@@ -302,7 +319,16 @@ export const processVideo = async (videoData) => {
   } catch (error) {
     console.error('Error processing video:', error);
     // Return original video if processing fails
-    return videoData;
+    if (videoData && (videoData.uri || videoData.path)) {
+      return {
+        uri: videoData.uri || videoData.path,
+        duration: videoData.duration || 0,
+        fileSize: videoData.size || 0,
+        mime: videoData.mime || 'video/mp4',
+      };
+    }
+    // If we don't have valid video data, rethrow
+    throw error;
   }
 };
 
@@ -353,6 +379,13 @@ export const createVideoThumbnail = async (videoUri) => {
  * @returns {Object} Compression settings
  */
 export const calculateCompressionSettings = (fileSize, targetSizeMB = MAX_IMAGE_SIZE_MB) => {
+  if (!fileSize || fileSize <= 0) {
+    return {
+      quality: 90,
+      resizeRatio: 1,
+    };
+  }
+
   const targetSize = targetSizeMB * MB_IN_BYTES;
   const ratio = targetSize / fileSize;
   
@@ -388,6 +421,11 @@ export const calculateCompressionSettings = (fileSize, targetSizeMB = MAX_IMAGE_
  */
 export const getImageDimensions = (uri) => {
   return new Promise((resolve, reject) => {
+    if (!uri) {
+      reject(new Error('Image URI is required'));
+      return;
+    }
+
     Image.getSize(
       uri,
       (width, height) => {
@@ -400,7 +438,12 @@ export const getImageDimensions = (uri) => {
   });
 };
 
-// Export a unified media picker and processor for easier integration
+/**
+ * Unified media picker and processor for easier integration
+ * 
+ * @param {Object} options - Picker options
+ * @returns {Promise<Object|Array>} Processed media
+ */
 export const pickAndProcessMedia = async (options) => {
   try {
     const {
@@ -410,7 +453,7 @@ export const pickAndProcessMedia = async (options) => {
       includeBase64 = false,
       cropping = false,
       ...restOptions
-    } = options;
+    } = options || {};
     
     // Open picker based on media type
     let result;
@@ -444,16 +487,19 @@ export const pickAndProcessMedia = async (options) => {
       if (multiple && Array.isArray(result)) {
         const processed = await Promise.all(result.map(img => processImage(img)));
         return processed;
-      } else {
+      } else if (result) {
         const processed = await processImage(result);
         return processed;
       }
+      return null;
     } else if (mediaType === 'video') {
       result = await ImagePicker.openPicker({
         mediaType: 'video',
         compressVideoPreset: 'MediumQuality',
         ...restOptions,
       });
+      
+      if (!result) return null;
       
       const processed = await processVideo(result);
       return processed;
@@ -468,15 +514,16 @@ export const pickAndProcessMedia = async (options) => {
       // Process each item based on its type
       if (Array.isArray(result)) {
         const processed = await Promise.all(
-          result.map(item =>
-            item.mime && item.mime.startsWith('image/')
+          result.map(item => {
+            if (!item || !item.mime) return null;
+            return item.mime.startsWith('image/')
               ? processImage(item)
-              : processVideo(item)
-          )
+              : processVideo(item);
+          })
         );
         
-        return processed;
-      } else if (result.mime) {
+        return processed.filter(item => item !== null);
+      } else if (result && result.mime) {
         // Handle single item selection
         return result.mime.startsWith('image/') 
           ? processImage(result) 
@@ -484,7 +531,7 @@ export const pickAndProcessMedia = async (options) => {
       }
     }
     
-    return result;
+    return result || null;
   } catch (error) {
     console.error('Error picking and processing media:', error);
     throw error;
