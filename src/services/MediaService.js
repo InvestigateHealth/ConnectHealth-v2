@@ -1,32 +1,7 @@
 // src/services/MediaService.js
 // Enhanced service for handling media uploads across platforms with improved security and reliability
 
-import { Platform, Alert         } catch (error) {
-          console.error(`Error processing file ${file.path}:`, error);
-        }
-      }
-    } catch (error) {
-      console.error('Error cleaning up temp files:', error);
-    }
-  }
-}
-
-// Create and export singleton instance
-const mediaService = new MediaService();
-
-// Initialize the service
-mediaService.initialize().catch(error => {
-  console.error('Failed to initialize media service:', error);
-});
-
-// Clean up temp files periodically
-setInterval(() => {
-  mediaService.cleanupTempFiles().catch(error => {
-    console.error('Failed to clean up temp files:', error);
-  });
-}, 12 * 60 * 60 * 1000); // Every 12 hours
-
-export default mediaService; from 'react-native';
+import { Platform, Alert } from 'react-native';
 import ImagePicker from 'react-native-image-crop-picker';
 import ImageResizer from 'react-native-image-resizer';
 import RNFS from 'react-native-fs';
@@ -932,3 +907,29 @@ class MediaService {
           if (fileAge > ONE_DAY_MS) {
             await RNFS.unlink(file.path);
           }
+        } catch (error) {
+          console.error(`Error processing file ${file.path}:`, error);
+        }
+      }
+    } catch (error) {
+      console.error('Error cleaning up temp files:', error);
+    }
+  }
+}
+
+// Create singleton instance
+const mediaService = new MediaService();
+
+// Initialize the service
+mediaService.initialize().catch(error => {
+  console.error('Failed to initialize media service:', error);
+});
+
+// Clean up temp files periodically
+setInterval(() => {
+  mediaService.cleanupTempFiles().catch(error => {
+    console.error('Failed to clean up temp files:', error);
+  });
+}, 12 * 60 * 60 * 1000); // Every 12 hours
+
+export default mediaService;
