@@ -1,5 +1,5 @@
 // src/utils/SecurityUtils.js
-// Utilities for security and privacy
+// Improved utilities for security and privacy
 
 import { Platform } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -8,16 +8,9 @@ import auth from '@react-native-firebase/auth';
 import firestore from '@react-native-firebase/firestore';
 import { sanitizeInput } from './validationUtils';
 import NetInfo from '@react-native-community/netinfo';
+import crypto from 'crypto-js';
 
-// Use safe require for optional dependencies
-let CryptoJS = null;
-try {
-  CryptoJS = require('crypto-js');
-} catch (err) {
-  console.warn('CryptoJS not available, some security features will be limited');
-}
-
-// Disposable email domains list
+// DISPOSABLE_EMAIL_DOMAINS list - expanded with more domains
 const DISPOSABLE_EMAIL_DOMAINS = [
   'mailinator.com', 'trashmail.com', 'guerrillamail.com', 
   'tempmail.com', '10minutemail.com', 'yopmail.com',
@@ -25,18 +18,25 @@ const DISPOSABLE_EMAIL_DOMAINS = [
   'temp-mail.org', 'spamgourmet.com', 'dispostable.com',
   'mintemail.com', 'mailnull.com', 'mytrashmail.com',
   'throwawaymailm.com', 'sharklasers.com', 'armyspy.com',
-  'wegwerfemail.de', 'tempmail.net', 'getnada.com'
+  'wegwerfemail.de', 'tempmail.net', 'getnada.com',
+  'mailbox.org', 'maildrop.cc', 'getairmail.com', 
+  'mailexpire.com', 'momentmail.com', 'emailsensei.com',
+  'tempinbox.com', 'throwawaymail.com', 'discard.email',
+  'temp-mail.ru', 'temp-mail.com', 'tempemail.net'
 ];
 
 /**
  * Security utilities for encryption, data sanitization, and privacy features
+ * Improved with better entropy generation, modern APIs, and secure storage
  */
 class SecurityUtils {
   constructor() {
     // Initialize encryption key
     this.encryptionKey = null;
-    this.encryptionAvailable = !!CryptoJS;
+    this.encryptionAvailable = true;
     this.isConnected = true;
+    this.initialized = false;
+    this.keychainAvailable = false;
     
     // Try to initialize key on startup
     this.initializeEncryptionKey();
@@ -54,44 +54,82 @@ class SecurityUtils {
 
   /**
    * Initialize encryption key from secure storage
+   * Improved with better fallback strategy and entropy generation
    */
   async initializeEncryptionKey() {
-    if (!this.encryptionAvailable) {
-      console.warn('Encryption is not available due to missing CryptoJS');
-      return;
-    }
-
     try {
+      // Check if keychain is available
+      this.keychainAvailable = await this.isKeychainAvailable();
+      
       // Try to get from keychain (most secure)
       let key = await this.getSecureKey();
       
       if (key) {
         this.encryptionKey = key;
+        this.initialized = true;
         return;
       }
       
-      // Generate a new key if not found
+      // Generate a new key with high entropy
       console.log('Generating new encryption key');
       key = this.generateSecureRandomString(32);
       
       // Save the new key
       await this.saveSecureKey(key);
       this.encryptionKey = key;
+      this.initialized = true;
     } catch (error) {
       console.error('Error initializing encryption key:', error);
       // Will fall back to generating a key when needed
+      this.initialized = false;
+    }
+  }
+
+  /**
+   * Check if keychain is available on this device
+   * @returns {Promise<boolean>} Whether keychain is available
+   */
+  async isKeychainAvailable() {
+    if (Platform.OS !== 'ios' && Platform.OS !== 'android') {
+      return false;
+    }
+    
+    try {
+      // Try to set a test value
+      const testResult = await RNKeychain.setGenericPassword(
+        'test_user',
+        'test_password',
+        {
+          service: 'test_service',
+          accessible: RNKeychain.ACCESSIBLE.WHEN_UNLOCKED_THIS_DEVICE_ONLY
+        }
+      );
+      
+      // Try to retrieve it
+      const credentials = await RNKeychain.getGenericPassword({
+        service: 'test_service'
+      });
+      
+      // Clean up test value
+      await RNKeychain.resetGenericPassword({ service: 'test_service' });
+      
+      return Boolean(testResult && credentials);
+    } catch (error) {
+      console.warn('Keychain is not available:', error);
+      return false;
     }
   }
 
   /**
    * Get encryption key from secure storage
+   * Improved with better error handling and fallback mechanisms
    * 
    * @returns {Promise<string|null>} Encryption key or null
    */
   async getSecureKey() {
     try {
       // Try keychain first (more secure)
-      if (Platform.OS === 'ios' || Platform.OS === 'android') {
+      if (this.keychainAvailable) {
         try {
           const credentials = await RNKeychain.getGenericPassword({
             service: 'deviceEncryptionKey'
@@ -105,11 +143,17 @@ class SecurityUtils {
         }
       }
       
-      // Fall back to AsyncStorage, but only as a last resort
+      // Fall back to AsyncStorage with additional safety checks
       const storageKey = await AsyncStorage.getItem('deviceEncryptionKey');
-      if (storageKey) {
-        // If we found a key in AsyncStorage, try to migrate it to Keychain
-        if ((Platform.OS === 'ios' || Platform.OS === 'android') && RNKeychain) {
+      if (storageKey && storageKey.length >= 16) {
+        // Verify key format to ensure it's valid
+        if (!/^[A-Za-z0-9+/=]+$/.test(storageKey)) {
+          console.warn('Retrieved encryption key appears to be invalid');
+          return null;
+        }
+        
+        // If we found a key in AsyncStorage and keychain is available, try to migrate it
+        if (this.keychainAvailable) {
           try {
             await RNKeychain.setGenericPassword('deviceEncryptionKey', storageKey, {
               service: 'deviceEncryptionKey',
@@ -135,30 +179,51 @@ class SecurityUtils {
 
   /**
    * Save encryption key to secure storage
+   * Improved with better error handling and retries
    * 
    * @param {string} key - Key to save
    * @returns {Promise<boolean>} Success status
    */
   async saveSecureKey(key) {
     try {
-      if (!key) return false;
+      if (!key || key.length < 16) {
+        console.error('Invalid encryption key');
+        return false;
+      }
       
       // Try to use keychain (most secure)
-      if ((Platform.OS === 'ios' || Platform.OS === 'android') && RNKeychain) {
+      if (this.keychainAvailable) {
         try {
-          await RNKeychain.setGenericPassword('deviceEncryptionKey', key, {
+          const result = await RNKeychain.setGenericPassword('deviceEncryptionKey', key, {
             service: 'deviceEncryptionKey',
             accessible: RNKeychain.ACCESSIBLE.WHEN_UNLOCKED_THIS_DEVICE_ONLY
           });
-          return true;
+          
+          if (result) {
+            return true;
+          } else {
+            console.warn('Keychain returned no result, falling back to AsyncStorage');
+          }
         } catch (keychainError) {
           console.warn('Failed to save to Keychain, falling back to AsyncStorage:', keychainError);
         }
       }
       
-      // Fall back to AsyncStorage
-      await AsyncStorage.setItem('deviceEncryptionKey', key);
-      return true;
+      // Fall back to AsyncStorage with safety confirmation
+      try {
+        await AsyncStorage.setItem('deviceEncryptionKey', key);
+        
+        // Verify storage succeeded
+        const verification = await AsyncStorage.getItem('deviceEncryptionKey');
+        if (verification !== key) {
+          throw new Error('Storage verification failed');
+        }
+        
+        return true;
+      } catch (asyncStorageError) {
+        console.error('Error saving to AsyncStorage:', asyncStorageError);
+        return false;
+      }
     } catch (error) {
       console.error('Error saving secure key:', error);
       return false;
@@ -167,14 +232,20 @@ class SecurityUtils {
 
   /**
    * Encrypt sensitive data
+   * Improved with better error handling and initialization checks
    * 
    * @param {string|object} data - Data to encrypt
    * @returns {Promise<string|null>} Encrypted data or null
    */
   async encryptData(data) {
-    if (!this.encryptionAvailable || !CryptoJS) {
-      console.warn('Encryption not available. Data will not be encrypted!');
-      return typeof data === 'string' ? data : JSON.stringify(data);
+    if (!this.initialized) {
+      // Try to initialize again if not already done
+      await this.initializeEncryptionKey();
+      
+      if (!this.initialized) {
+        console.warn('Encryption not initialized. Data will not be encrypted!');
+        return typeof data === 'string' ? data : JSON.stringify(data);
+      }
     }
 
     try {
@@ -191,8 +262,17 @@ class SecurityUtils {
         }
       }
       
-      // Encrypt the data
-      return CryptoJS.AES.encrypt(dataString, this.encryptionKey).toString();
+      // Encrypt the data with improved algorithm
+      // Use AES with CBC mode and a random IV for better security
+      const iv = crypto.lib.WordArray.random(16);
+      const encrypted = crypto.AES.encrypt(dataString, this.encryptionKey, {
+        iv: iv,
+        mode: crypto.mode.CBC,
+        padding: crypto.pad.Pkcs7
+      });
+      
+      // Combine IV and ciphertext for storage
+      return iv.toString() + encrypted.toString();
     } catch (error) {
       console.error('Encryption error:', error);
       return null;
@@ -201,22 +281,34 @@ class SecurityUtils {
 
   /**
    * Decrypt encrypted data
+   * Improved with better error handling and format validation
    * 
    * @param {string} encryptedData - Encrypted data to decrypt
    * @returns {Promise<string|object|null>} Decrypted data
    */
   async decryptData(encryptedData) {
-    if (!this.encryptionAvailable || !CryptoJS) {
-      console.warn('Decryption not available. Returning data as-is!');
-      try {
-        return JSON.parse(encryptedData);
-      } catch {
-        return encryptedData;
+    if (!this.initialized) {
+      // Try to initialize again if not already done
+      await this.initializeEncryptionKey();
+      
+      if (!this.initialized) {
+        console.warn('Decryption not initialized. Returning data as-is!');
+        try {
+          return JSON.parse(encryptedData);
+        } catch {
+          return encryptedData;
+        }
       }
     }
 
     try {
       if (!encryptedData) {
+        return null;
+      }
+      
+      // Validate that encryptedData is a string and has expected format
+      if (typeof encryptedData !== 'string' || encryptedData.length < 32) {
+        console.warn('Invalid encrypted data format');
         return null;
       }
 
@@ -230,20 +322,55 @@ class SecurityUtils {
         }
       }
       
-      // Decrypt the data
-      const decryptedBytes = CryptoJS.AES.decrypt(encryptedData, this.encryptionKey);
-      const decryptedText = decryptedBytes.toString(CryptoJS.enc.Utf8);
-      
-      if (!decryptedText) {
-        console.warn('Decryption resulted in empty string');
-        return null;
-      }
-      
-      // Try to parse as JSON, return as string if not valid JSON
       try {
-        return JSON.parse(decryptedText);
-      } catch {
-        return decryptedText;
+        // Extract IV (first 32 characters) and ciphertext
+        const iv = crypto.enc.Hex.parse(encryptedData.substring(0, 32));
+        const ciphertext = encryptedData.substring(32);
+        
+        // Decrypt the data
+        const decryptedBytes = crypto.AES.decrypt(ciphertext, this.encryptionKey, {
+          iv: iv,
+          mode: crypto.mode.CBC,
+          padding: crypto.pad.Pkcs7
+        });
+        
+        const decryptedText = decryptedBytes.toString(crypto.enc.Utf8);
+        
+        if (!decryptedText) {
+          console.warn('Decryption resulted in empty string');
+          return null;
+        }
+        
+        // Try to parse as JSON, return as string if not valid JSON
+        try {
+          return JSON.parse(decryptedText);
+        } catch {
+          return decryptedText;
+        }
+      } catch (cryptoError) {
+        // Handle invalid ciphertext format
+        console.error('Failed to decrypt data, may be using old format:', cryptoError);
+        
+        // Try with old format (without IV)
+        try {
+          const decryptedBytes = crypto.AES.decrypt(encryptedData, this.encryptionKey);
+          const decryptedText = decryptedBytes.toString(crypto.enc.Utf8);
+          
+          if (!decryptedText) {
+            console.warn('Legacy decryption resulted in empty string');
+            return null;
+          }
+          
+          // Try to parse as JSON, return as string if not valid JSON
+          try {
+            return JSON.parse(decryptedText);
+          } catch {
+            return decryptedText;
+          }
+        } catch (legacyError) {
+          console.error('Legacy decryption failed:', legacyError);
+          return null;
+        }
       }
     } catch (error) {
       console.error('Decryption error:', error);
@@ -253,6 +380,7 @@ class SecurityUtils {
 
   /**
    * Store sensitive data securely
+   * Improved with better security considerations
    * 
    * @param {string} key - Storage key
    * @param {string|object} data - Data to store
@@ -264,11 +392,14 @@ class SecurityUtils {
         throw new Error('Storage key is required');
       }
       
-      // For sensitive information, use keychain
-      if ((Platform.OS === 'ios' || Platform.OS === 'android') && RNKeychain) {
+      // For sensitive information, use keychain when available
+      if (this.keychainAvailable) {
         try {
           const stringValue = typeof data === 'object' ? JSON.stringify(data) : String(data);
-          await RNKeychain.setGenericPassword(key, stringValue, { service: key });
+          await RNKeychain.setGenericPassword(key, stringValue, { 
+            service: key,
+            accessible: RNKeychain.ACCESSIBLE.WHEN_UNLOCKED_THIS_DEVICE_ONLY
+          });
           return true;
         } catch (keychainError) {
           console.warn('Keychain error, falling back to encrypted storage:', keychainError);
@@ -278,7 +409,7 @@ class SecurityUtils {
       // Fallback to encrypted AsyncStorage
       const encryptedData = await this.encryptData(data);
       if (encryptedData) {
-        await AsyncStorage.setItem(key, encryptedData);
+        await AsyncStorage.setItem(`encrypted_${key}`, encryptedData);
         return true;
       }
       return false;
@@ -290,6 +421,7 @@ class SecurityUtils {
 
   /**
    * Retrieve sensitive data securely
+   * Improved with better error handling and format validation
    * 
    * @param {string} key - Storage key
    * @returns {Promise<any>} Retrieved data
@@ -300,12 +432,12 @@ class SecurityUtils {
         throw new Error('Storage key is required');
       }
       
-      // For sensitive information, use keychain
-      if ((Platform.OS === 'ios' || Platform.OS === 'android') && RNKeychain) {
+      // For sensitive information, try keychain first when available
+      if (this.keychainAvailable) {
         try {
           const credentials = await RNKeychain.getGenericPassword({ service: key });
           
-          if (credentials) {
+          if (credentials && credentials.password) {
             // Try to parse as JSON if possible
             try {
               return JSON.parse(credentials.password);
@@ -319,8 +451,9 @@ class SecurityUtils {
       }
       
       // Fallback to encrypted AsyncStorage
-      const encryptedData = await AsyncStorage.getItem(key);
+      const encryptedData = await AsyncStorage.getItem(`encrypted_${key}`);
       if (!encryptedData) return null;
+      
       return await this.decryptData(encryptedData);
     } catch (error) {
       console.error('Error retrieving secure data:', error);
@@ -330,6 +463,7 @@ class SecurityUtils {
 
   /**
    * Remove secure data
+   * Improved with comprehensive cleanup
    * 
    * @param {string} key - Storage key
    * @returns {Promise<boolean>} Success status
@@ -342,7 +476,8 @@ class SecurityUtils {
       
       let success = false;
       
-      if ((Platform.OS === 'ios' || Platform.OS === 'android') && RNKeychain) {
+      // Try to remove from keychain
+      if (this.keychainAvailable) {
         try {
           await RNKeychain.resetGenericPassword({ service: key });
           success = true;
@@ -351,9 +486,15 @@ class SecurityUtils {
         }
       }
       
-      // Also try to remove from AsyncStorage
-      await AsyncStorage.removeItem(key);
-      return true;
+      // Also try to remove from AsyncStorage (both encrypted and unencrypted versions)
+      try {
+        await AsyncStorage.multiRemove([key, `encrypted_${key}`]);
+        success = true;
+      } catch (asyncStorageError) {
+        console.error('AsyncStorage error during removal:', asyncStorageError);
+      }
+      
+      return success;
     } catch (error) {
       console.error('Error removing secure data:', error);
       return false;
@@ -361,28 +502,44 @@ class SecurityUtils {
   }
 
   /**
-   * Generate a secure random string
+   * Generate a secure random string with high entropy
+   * Significantly improved with better entropy sources
    * 
    * @param {number} length - Length of the string
    * @returns {string} Random string
    */
   generateSecureRandomString(length = 16) {
-    if (!this.encryptionAvailable || !CryptoJS) {
+    try {
+      // Ensure length is at least 16 and at most 64
+      const safeLength = Math.max(16, Math.min(length, 64));
+      
+      // Generate random bytes with high entropy
+      let randomBytes;
+      
+      // Use the most secure method available
+      randomBytes = crypto.lib.WordArray.random(Math.ceil(safeLength / 2));
+      
+      // Convert to a string suitable for use as a key
+      return randomBytes.toString(crypto.enc.Base64).slice(0, safeLength);
+    } catch (error) {
+      console.error('Error generating secure random string:', error);
+      
       // Fallback to less secure but functional random string generation
       let result = '';
-      const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+      const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_=+';
       const charactersLength = characters.length;
       
-      for (let i = 0; i < length; i++) {
+      // Mix in timestamp for additional entropy
+      const timestamp = Date.now().toString();
+      result += timestamp.substring(timestamp.length - 4);
+      
+      // Fill the rest with random characters
+      for (let i = result.length; i < length; i++) {
         result += characters.charAt(Math.floor(Math.random() * charactersLength));
       }
       
       return result;
     }
-    
-    // Ensure length is at least 8 and at most 64
-    const safeLength = Math.max(8, Math.min(length, 64));
-    return CryptoJS.lib.WordArray.random(Math.ceil(safeLength / 2)).toString();
   }
 
   /**
@@ -398,12 +555,16 @@ class SecurityUtils {
 
   /**
    * Sanitize URL to prevent unsafe links
+   * Improved with better validation
    * 
    * @param {string} url - URL to sanitize
    * @returns {string|null} Sanitized URL or null if invalid
    */
   sanitizeURL(url) {
     if (!url) return null;
+    
+    // Trim whitespace
+    url = url.trim();
     
     // Add protocol if missing
     if (!/^https?:\/\//i.test(url)) {
@@ -413,10 +574,32 @@ class SecurityUtils {
     // Check if URL is valid
     try {
       const parsedURL = new URL(url);
+      
       // Only allow http and https URLs
       if (parsedURL.protocol !== 'http:' && parsedURL.protocol !== 'https:') {
         return null;
       }
+      
+      // Check for suspicious patterns
+      const domain = parsedURL.hostname.toLowerCase();
+      const path = parsedURL.pathname.toLowerCase();
+      
+      // List of suspicious patterns in URLs
+      const suspiciousPatterns = [
+        /\.(exe|dll|bat|sh|cmd|msi|vbs|ps1)$/i, // Executable extensions
+        /^data:/i, // Data URLs
+        /^javascript:/i, // JavaScript URLs
+        /^vbscript:/i, // VBScript URLs
+        /^file:/i, // File URLs
+      ];
+      
+      // Check for suspicious patterns
+      for (const pattern of suspiciousPatterns) {
+        if (pattern.test(url)) {
+          return null;
+        }
+      }
+      
       return parsedURL.toString();
     } catch (e) {
       return null;
@@ -425,6 +608,7 @@ class SecurityUtils {
 
   /**
    * Check if email domain is from disposable email provider
+   * Improved with better matching algorithm
    * 
    * @param {string} email - Email to check
    * @returns {boolean} Whether email is from disposable provider
@@ -432,19 +616,27 @@ class SecurityUtils {
   isDisposableEmail(email) {
     if (!email || !email.includes('@')) return false;
     
+    // Extract the domain part
     const domain = email.split('@')[1].toLowerCase();
     
-    // Use imported list or fallback to a minimal set
-    const disposableDomains = DISPOSABLE_EMAIL_DOMAINS || [
-      'mailinator.com', 'trashmail.com', 'guerrillamail.com', 
-      'tempmail.com', '10minutemail.com', 'yopmail.com'
-    ];
+    // Check exact matches
+    if (DISPOSABLE_EMAIL_DOMAINS.includes(domain)) {
+      return true;
+    }
     
-    return disposableDomains.includes(domain);
+    // Check for subdomains of known disposable providers
+    for (const disposableDomain of DISPOSABLE_EMAIL_DOMAINS) {
+      if (domain.endsWith(`.${disposableDomain}`)) {
+        return true;
+      }
+    }
+    
+    return false;
   }
 
   /**
    * Redact sensitive information from text
+   * Improved with more comprehensive patterns and better handling
    * 
    * @param {string} text - Text to redact
    * @returns {string} Redacted text
@@ -454,16 +646,20 @@ class SecurityUtils {
     
     // Patterns for common sensitive information
     const patterns = {
-      // Credit card numbers
+      // Credit card numbers (improved pattern)
       creditCard: /\b(?:\d{4}[ -]?){3}\d{4}\b/g,
-      // Social Security Numbers
+      // Social Security Numbers (improved pattern with optional dashes)
       ssn: /\b\d{3}[-\s]?\d{2}[-\s]?\d{4}\b/g,
       // Email addresses
       email: /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g,
-      // Phone numbers
-      phone: /\b(?:\+?1[-\s]?)?\(?([0-9]{3})\)?[-\s]?([0-9]{3})[-\s]?([0-9]{4})\b/g,
-      // Street addresses (basic pattern)
-      address: /\b\d+\s+[A-Za-z\s]+(?:street|st|avenue|ave|road|rd|boulevard|blvd|lane|ln|drive|dr|way|court|ct)\b/gi,
+      // Phone numbers (improved pattern for international formats)
+      phone: /\b(?:\+?\d{1,3}[-\s.]?)?\(?(?:\d{2,3})\)?[-\s.]?(?:\d{2,4})[-\s.]?(?:\d{2,4})[-\s.]?(?:\d{2,4})\b/g,
+      // Street addresses (improved pattern)
+      address: /\b\d+\s+[A-Za-z\s,]+(?:street|st|avenue|ave|road|rd|boulevard|blvd|lane|ln|drive|dr|way|court|ct|plaza|square|sq|parkway|pkwy|circle|cir|highway|hwy)\b/gi,
+      // Passport numbers (basic patterns for US/UK/Canada)
+      passport: /\b[A-Z]{1,2}[0-9]{6,9}\b/g,
+      // Bank account numbers (generic pattern)
+      bankAccount: /\b\d{8,17}\b/g,
     };
     
     let redactedText = text;
@@ -474,13 +670,20 @@ class SecurityUtils {
         if (type === 'email') {
           // Keep domain for emails
           const parts = match.split('@');
-          return '***@' + parts[1];
+          if (parts.length === 2) {
+            return '***@' + parts[1];
+          }
+          return '***@***';
         } else if (type === 'creditCard') {
           // Keep last 4 digits for credit cards
-          return '****-****-****-' + match.slice(-4);
+          return '****-****-****-' + match.replace(/\D/g, '').slice(-4);
         } else if (type === 'phone') {
           // Keep last 4 digits for phone numbers
-          return '(***) ***-' + match.slice(-4);
+          const digits = match.replace(/\D/g, '');
+          return '(***) ***-' + digits.slice(-4);
+        } else if (type === 'ssn') {
+          // Use standard SSN redaction format
+          return '***-**-' + match.replace(/\D/g, '').slice(-4);
         } else {
           // Full redaction for other types
           return '*'.repeat(Math.min(match.length, 8)) + '...';
@@ -493,6 +696,7 @@ class SecurityUtils {
 
   /**
    * Report inappropriate content to moderators
+   * Improved with better error handling and data validation
    * 
    * @param {string} contentType - Type of content (post, comment, user)
    * @param {string} contentId - ID of the content
@@ -506,42 +710,72 @@ class SecurityUtils {
         throw new Error('Content type, content ID, and reporter ID are required');
       }
       
+      // Validate content type
+      const validContentTypes = ['post', 'comment', 'user', 'message', 'profile'];
+      if (!validContentTypes.includes(contentType)) {
+        throw new Error('Invalid content type');
+      }
+      
       // Check network connectivity
       const netInfo = await NetInfo.fetch();
       if (!netInfo.isConnected) {
         // Store report locally to submit later
-        const pendingReports = JSON.parse(await AsyncStorage.getItem('pendingReports') || '[]');
-        pendingReports.push({
-          contentType,
-          contentId,
-          reporterId,
-          reason: this.sanitizeInput(reason || ''),
-          timestamp: Date.now()
-        });
-        await AsyncStorage.setItem('pendingReports', JSON.stringify(pendingReports));
-        return true;
+        try {
+          const pendingReports = JSON.parse(await AsyncStorage.getItem('pendingReports') || '[]');
+          pendingReports.push({
+            contentType,
+            contentId,
+            reporterId,
+            reason: this.sanitizeInput(reason || ''),
+            timestamp: Date.now()
+          });
+          await AsyncStorage.setItem('pendingReports', JSON.stringify(pendingReports));
+          return true;
+        } catch (storageError) {
+          console.error('Error storing pending report:', storageError);
+          throw new Error('Failed to save report. Please try again when online.');
+        }
       }
       
       const sanitizedReason = this.sanitizeInput(reason || '');
       
-      await firestore().collection('reports').add({
+      // Create the report in Firestore
+      const reportData = {
         contentType,
         contentId,
         reporterId,
         reason: sanitizedReason,
         timestamp: firestore.FieldValue.serverTimestamp(),
-        status: 'pending'
-      });
+        status: 'pending',
+        platform: Platform.OS,
+        appVersion: require('../../package.json').version,
+      };
+      
+      await firestore().collection('reports').add(reportData);
+      
+      // Also update a counter on the reported content to flag for review
+      // if multiple reports are received
+      try {
+        const contentRef = firestore().collection(contentType + 's').doc(contentId);
+        await contentRef.update({
+          reportCount: firestore.FieldValue.increment(1),
+          lastReportedAt: firestore.FieldValue.serverTimestamp()
+        });
+      } catch (updateError) {
+        console.warn('Error updating report count on content:', updateError);
+        // Continue since the report was still created
+      }
       
       return true;
     } catch (error) {
       console.error('Error reporting inappropriate content:', error);
-      return false;
+      throw error;
     }
   }
 
   /**
    * Check for potential spambots based on user behavior
+   * Improved with more sophisticated detection
    * 
    * @param {Object} userData - User data to analyze
    * @returns {Object} Spam risk assessment
@@ -564,35 +798,69 @@ class SecurityUtils {
       riskScore += 25;
     }
     
-    if (userData.bio && /http|www|\[url\]/i.test(userData.bio)) {
+    // Check for links in bio/profile
+    if (userData.bio && /https?:\/\/|www\.|[a-z0-9](\.[a-z0-9])+/i.test(userData.bio)) {
       riskFactors.push('links_in_bio');
       riskScore += 15;
     }
     
-    if (userData.creationTimestamp) {
-      const accountAge = Date.now() - userData.creationTimestamp;
+    // Check for high post rate for new accounts
+    if (userData.createdAt || userData.creationTimestamp) {
+      const creationTime = userData.createdAt?.toMillis?.() || 
+                           userData.creationTimestamp || 
+                           Date.now();
+      const accountAge = Date.now() - creationTime;
       const hoursSinceCreation = accountAge / (1000 * 60 * 60);
       
+      // New account with many posts
       if (hoursSinceCreation < 24 && userData.postCount > 10) {
         riskFactors.push('high_post_rate_new_account');
         riskScore += 30;
       }
+      
+      // Extremely high post rate
+      const postsPerHour = userData.postCount / Math.max(1, hoursSinceCreation);
+      if (postsPerHour > 5) {
+        riskFactors.push('excessive_posting_rate');
+        riskScore += 20;
+      }
     }
     
-    if (userData.postCount > 0 && userData.likes === 0) {
+    // Check for no engagement on posts
+    if (userData.postCount > 5 && userData.totalLikesReceived === 0) {
       riskFactors.push('no_engagement');
+      riskScore += 15;
+    }
+    
+    // Check for repetitive content
+    if (userData.postSimilarityScore && userData.postSimilarityScore > 0.9) {
+      riskFactors.push('repetitive_content');
+      riskScore += 25;
+    }
+    
+    // Check for suspicious username patterns
+    if (userData.username && /^[a-z0-9]+\d{4,}$/i.test(userData.username)) {
+      riskFactors.push('bot_like_username');
       riskScore += 10;
+    }
+    
+    // Multiple reports from other users
+    if (userData.reportCount && userData.reportCount > 3) {
+      riskFactors.push('multiple_user_reports');
+      riskScore += 20;
     }
     
     return {
       riskScore,
       riskFactors,
-      isLikelySpam: riskScore >= 50
+      isLikelySpam: riskScore >= 50,
+      requiresReview: riskScore >= 30
     };
   }
 
   /**
    * Get authenticated user's security level
+   * Improved with caching for better performance
    * 
    * @returns {Promise<number>} Security level (0-3)
    */
@@ -601,6 +869,21 @@ class SecurityUtils {
       const user = auth().currentUser;
       if (!user) return 0;
       
+      // Check for cached security level first
+      try {
+        const cachedLevel = await AsyncStorage.getItem(`securityLevel_${user.uid}`);
+        if (cachedLevel && !isNaN(parseInt(cachedLevel))) {
+          // Only use cache if it's recent (within last hour)
+          const cacheTimestamp = await AsyncStorage.getItem(`securityLevelTimestamp_${user.uid}`);
+          if (cacheTimestamp && (Date.now() - parseInt(cacheTimestamp)) < 60 * 60 * 1000) {
+            return parseInt(cachedLevel);
+          }
+        }
+      } catch (cacheError) {
+        console.warn('Error reading cached security level:', cacheError);
+      }
+      
+      // Get fresh data from Firestore
       const userDoc = await firestore().collection('users').doc(user.uid).get();
       if (!userDoc.exists) return 0;
       
@@ -613,13 +896,23 @@ class SecurityUtils {
       // 2 - Verified user
       // 3 - Admin/Moderator
       
+      let securityLevel = 1; // Default for authenticated users
+      
       if (userData.role === 'admin' || userData.role === 'moderator') {
-        return 3;
+        securityLevel = 3;
       } else if (userData.verified) {
-        return 2;
-      } else {
-        return 1;
+        securityLevel = 2;
       }
+      
+      // Cache the result
+      try {
+        await AsyncStorage.setItem(`securityLevel_${user.uid}`, securityLevel.toString());
+        await AsyncStorage.setItem(`securityLevelTimestamp_${user.uid}`, Date.now().toString());
+      } catch (cacheError) {
+        console.warn('Error caching security level:', cacheError);
+      }
+      
+      return securityLevel;
     } catch (error) {
       console.error('Error getting user security level:', error);
       return 0;
@@ -628,6 +921,7 @@ class SecurityUtils {
 
   /**
    * Check if user has permission for an action
+   * Improved with better role-based access control
    * 
    * @param {string} action - Action to check
    * @param {Object} resource - Resource being acted upon
@@ -640,21 +934,41 @@ class SecurityUtils {
       
       const securityLevel = await this.getUserSecurityLevel();
       
-      // Define permission rules
+      // Define permission rules with more granular control
       const permissionRules = {
+        // Post related permissions
         'post.create': { minLevel: 1 },
         'post.edit': { minLevel: 1, ownerOnly: true },
         'post.delete': { minLevel: 1, ownerOnly: true },
+        'post.report': { minLevel: 1 },
+        'post.view': { minLevel: 1 },
+        'post.moderate': { minLevel: 3 },
+        
+        // Comment related permissions
         'comment.create': { minLevel: 1 },
         'comment.edit': { minLevel: 1, ownerOnly: true },
         'comment.delete': { minLevel: 1, ownerOnly: true },
+        'comment.report': { minLevel: 1 },
         'comment.moderate': { minLevel: 3 },
+        
+        // User profile related permissions
         'user.view': { minLevel: 1 },
         'user.edit': { minLevel: 1, ownerOnly: true },
         'user.delete': { minLevel: 1, ownerOnly: true },
         'user.block': { minLevel: 1 },
+        'user.report': { minLevel: 1 },
         'user.moderate': { minLevel: 3 },
+        
+        // Medical data permissions (sensitive)
+        'medical.view': { minLevel: 1, ownerOnly: true },
+        'medical.edit': { minLevel: 1, ownerOnly: true },
+        'medical.share': { minLevel: 1, ownerOnly: true },
+        
+        // Administrative actions
         'admin.access': { minLevel: 3 },
+        'admin.users': { minLevel: 3 },
+        'admin.reports': { minLevel: 3 },
+        'admin.settings': { minLevel: 3 },
       };
       
       const rule = permissionRules[action];
@@ -664,9 +978,39 @@ class SecurityUtils {
       if (securityLevel < rule.minLevel) return false;
       
       // Check if action requires resource ownership
-      if (rule.ownerOnly && resource && resource.userId !== user.uid) {
-        // Admins/moderators (level 3) can override ownership requirement
-        return securityLevel >= 3;
+      if (rule.ownerOnly && resource) {
+        // Check various owner ID fields that might be present
+        const resourceOwnerId = resource.userId || resource.ownerId || resource.createdBy || resource.authorId;
+        
+        if (resourceOwnerId !== user.uid) {
+          // Admins/moderators (level 3) can override ownership requirement
+          return securityLevel >= 3;
+        }
+      }
+      
+      // Specific blocking checks
+      if (action.startsWith('post.') || action.startsWith('comment.')) {
+        // Check if user is blocked by content owner
+        const contentOwnerId = resource?.userId || resource?.authorId || resource?.createdBy;
+        
+        if (contentOwnerId && contentOwnerId !== user.uid) {
+          try {
+            const blockDoc = await firestore()
+              .collection('userBlocks')
+              .where('blockedBy', '==', contentOwnerId)
+              .where('blockedUser', '==', user.uid)
+              .limit(1)
+              .get();
+              
+            if (!blockDoc.empty) {
+              // User is blocked, deny permission
+              return false;
+            }
+          } catch (blockError) {
+            console.warn('Error checking block status:', blockError);
+            // Continue with permission check
+          }
+        }
       }
       
       return true;
@@ -678,6 +1022,7 @@ class SecurityUtils {
 
   /**
    * Create an audit log entry
+   * Improved with better offline support and retry mechanism
    * 
    * @param {string} userId - User ID
    * @param {string} action - Action performed
@@ -690,34 +1035,333 @@ class SecurityUtils {
         throw new Error('User ID and action are required');
       }
       
+      // Sanitize details to prevent malicious data
+      const sanitizedDetails = {};
+      Object.keys(details || {}).forEach(key => {
+        if (typeof details[key] === 'string') {
+          sanitizedDetails[key] = this.sanitizeInput(details[key]);
+        } else if (
+          details[key] === null || 
+          typeof details[key] === 'number' || 
+          typeof details[key] === 'boolean'
+        ) {
+          sanitizedDetails[key] = details[key];
+        } else if (typeof details[key] === 'object') {
+          // Convert objects to strings to avoid nested objects
+          sanitizedDetails[key] = JSON.stringify(details[key]);
+        }
+      });
+      
       // Check network connectivity
       const netInfo = await NetInfo.fetch();
       if (!netInfo.isConnected) {
         // Store audit log locally to sync later
-        const pendingLogs = JSON.parse(await AsyncStorage.getItem('pendingAuditLogs') || '[]');
-        pendingLogs.push({
-          userId,
-          action,
-          details,
-          timestamp: Date.now(),
-          userAgent: Platform.OS
-        });
-        await AsyncStorage.setItem('pendingAuditLogs', JSON.stringify(pendingLogs));
-        return true;
+        try {
+          const pendingLogs = JSON.parse(await AsyncStorage.getItem('pendingAuditLogs') || '[]');
+          
+          // Prevent duplicate logs
+          const isDuplicate = pendingLogs.some(log => 
+            log.userId === userId && 
+            log.action === action && 
+            Date.now() - log.timestamp < 10000 // Within last 10 seconds
+          );
+          
+          if (!isDuplicate) {
+            pendingLogs.push({
+              userId,
+              action,
+              details: sanitizedDetails,
+              timestamp: Date.now(),
+              userAgent: Platform.OS,
+              appVersion: require('../../package.json').version
+            });
+            
+            await AsyncStorage.setItem('pendingAuditLogs', JSON.stringify(pendingLogs));
+          }
+          return true;
+        } catch (storageError) {
+          console.error('Error storing pending audit log:', storageError);
+          return false;
+        }
       }
       
+      // Create the audit log in Firestore
       await firestore().collection('auditLogs').add({
         userId,
         action,
-        details,
+        details: sanitizedDetails,
         timestamp: firestore.FieldValue.serverTimestamp(),
         ipAddress: 'client-side', // Note: real IP should be added server-side
-        userAgent: Platform.OS
+        userAgent: Platform.OS,
+        appVersion: require('../../package.json').version
       });
       
       return true;
     } catch (error) {
       console.error('Error creating audit log:', error);
+      
+      // Save failed logs for retry
+      try {
+        const failedLogs = JSON.parse(await AsyncStorage.getItem('failedAuditLogs') || '[]');
+        failedLogs.push({
+          userId,
+          action,
+          details,
+          timestamp: Date.now(),
+          error: error.message,
+          retryCount: 0
+        });
+        await AsyncStorage.setItem('failedAuditLogs', JSON.stringify(failedLogs));
+      } catch (storageError) {
+        console.error('Error saving failed audit log:', storageError);
+      }
+      
+      return false;
+    }
+  }
+  
+  /**
+   * Sync pending audit logs when back online
+   * New method to handle retry mechanism
+   * 
+   * @returns {Promise<boolean>} Success status
+   */
+  async syncPendingAuditLogs() {
+    if (!this.isConnected) return false;
+    
+    try {
+      // Get pending logs
+      const pendingLogs = JSON.parse(await AsyncStorage.getItem('pendingAuditLogs') || '[]');
+      if (pendingLogs.length === 0) return true;
+      
+      // Get failed logs for retry
+      const failedLogs = JSON.parse(await AsyncStorage.getItem('failedAuditLogs') || '[]');
+      
+      // Combine logs that are ready for retry
+      const retryLogs = failedLogs.filter(log => {
+        const hoursPassed = (Date.now() - log.timestamp) / (1000 * 60 * 60);
+        const retryDelay = Math.min(24, Math.pow(2, log.retryCount)); // Exponential backoff
+        return hoursPassed >= retryDelay;
+      });
+      
+      const allLogs = [...pendingLogs, ...retryLogs];
+      if (allLogs.length === 0) return true;
+      
+      // Use batched writes for efficiency
+      const db = firestore();
+      let successCount = 0;
+      let batch = db.batch();
+      let batchCount = 0;
+      const maxBatchSize = 500; // Firestore batch limit
+      
+      for (const log of allLogs) {
+        try {
+          const docRef = db.collection('auditLogs').doc();
+          
+          batch.set(docRef, {
+            userId: log.userId,
+            action: log.action,
+            details: log.details || {},
+            timestamp: log.timestamp ? firestore.Timestamp.fromMillis(log.timestamp) : firestore.FieldValue.serverTimestamp(),
+            syncedFromOffline: true,
+            userAgent: log.userAgent || Platform.OS,
+            appVersion: log.appVersion || require('../../package.json').version
+          });
+          
+          batchCount++;
+          successCount++;
+          
+          // Commit batch when it reaches max size
+          if (batchCount >= maxBatchSize) {
+            await batch.commit();
+            batch = db.batch();
+            batchCount = 0;
+          }
+        } catch (error) {
+          console.error('Error preparing audit log batch:', error);
+        }
+      }
+      
+      // Commit remaining batch operations
+      if (batchCount > 0) {
+        await batch.commit();
+      }
+      
+      // Clear pending logs
+      await AsyncStorage.setItem('pendingAuditLogs', JSON.stringify([]));
+      
+      // Update failed logs by removing successful ones and incrementing retry count
+      const updatedFailedLogs = failedLogs.filter(log => {
+        const wasRetried = retryLogs.some(rl => 
+          rl.userId === log.userId && 
+          rl.action === log.action && 
+          rl.timestamp === log.timestamp
+        );
+        
+        return !wasRetried;
+      });
+      
+      await AsyncStorage.setItem('failedAuditLogs', JSON.stringify(updatedFailedLogs));
+      
+      return successCount > 0;
+    } catch (error) {
+      console.error('Error syncing audit logs:', error);
+      return false;
+    }
+  }
+  
+  /**
+   * Block a user to prevent interactions
+   * New method for user blocking functionality
+   * 
+   * @param {string} userToBlock - User ID to block
+   * @returns {Promise<boolean>} Success status
+   */
+  async blockUser(userToBlock) {
+    try {
+      const currentUser = auth().currentUser;
+      if (!currentUser || !userToBlock) {
+        throw new Error('Authentication required and valid user ID to block');
+      }
+      
+      if (currentUser.uid === userToBlock) {
+        throw new Error('Cannot block yourself');
+      }
+      
+      // Check if already blocked
+      const blockQuery = await firestore()
+        .collection('userBlocks')
+        .where('blockedBy', '==', currentUser.uid)
+        .where('blockedUser', '==', userToBlock)
+        .limit(1)
+        .get();
+        
+      if (!blockQuery.empty) {
+        // Already blocked
+        return true;
+      }
+      
+      // Create block document
+      await firestore().collection('userBlocks').add({
+        blockedBy: currentUser.uid,
+        blockedUser: userToBlock,
+        createdAt: firestore.FieldValue.serverTimestamp(),
+        reason: null
+      });
+      
+      // Also update current user's blockedUsers array for quicker client-side checking
+      await firestore().collection('users').doc(currentUser.uid).update({
+        blockedUsers: firestore.FieldValue.arrayUnion(userToBlock)
+      });
+      
+      // Create audit log
+      await this.createAuditLog(
+        currentUser.uid,
+        'user_blocked',
+        { blockedUser: userToBlock }
+      );
+      
+      return true;
+    } catch (error) {
+      console.error('Error blocking user:', error);
+      throw error;
+    }
+  }
+  
+  /**
+   * Unblock a previously blocked user
+   * New method to complement blocking functionality
+   * 
+   * @param {string} userToUnblock - User ID to unblock
+   * @returns {Promise<boolean>} Success status
+   */
+  async unblockUser(userToUnblock) {
+    try {
+      const currentUser = auth().currentUser;
+      if (!currentUser || !userToUnblock) {
+        throw new Error('Authentication required and valid user ID to unblock');
+      }
+      
+      // Find block document
+      const blockQuery = await firestore()
+        .collection('userBlocks')
+        .where('blockedBy', '==', currentUser.uid)
+        .where('blockedUser', '==', userToUnblock)
+        .limit(1)
+        .get();
+        
+      if (blockQuery.empty) {
+        // Not blocked, nothing to do
+        return true;
+      }
+      
+      // Delete block document
+      const batch = firestore().batch();
+      blockQuery.forEach(doc => {
+        batch.delete(doc.ref);
+      });
+      
+      // Update current user's blockedUsers array
+      const userRef = firestore().collection('users').doc(currentUser.uid);
+      batch.update(userRef, {
+        blockedUsers: firestore.FieldValue.arrayRemove(userToUnblock)
+      });
+      
+      await batch.commit();
+      
+      // Create audit log
+      await this.createAuditLog(
+        currentUser.uid,
+        'user_unblocked',
+        { unblockedUser: userToUnblock }
+      );
+      
+      return true;
+    } catch (error) {
+      console.error('Error unblocking user:', error);
+      throw error;
+    }
+  }
+  
+  /**
+   * Check if a user is blocked by another user
+   * New method to check block status
+   * 
+   * @param {string} blockedBy - User ID who might have blocked
+   * @param {string} potentiallyBlockedUser - User ID to check if blocked
+   * @returns {Promise<boolean>} Whether user is blocked
+   */
+  async isUserBlocked(blockedBy, potentiallyBlockedUser) {
+    try {
+      if (!blockedBy || !potentiallyBlockedUser) {
+        return false;
+      }
+      
+      // Check local cache first
+      try {
+        const cachedBlocks = await AsyncStorage.getItem(`userBlocks_${blockedBy}`);
+        if (cachedBlocks) {
+          const blockedUsers = JSON.parse(cachedBlocks);
+          if (Array.isArray(blockedUsers) && 
+              blockedUsers.includes(potentiallyBlockedUser)) {
+            return true;
+          }
+        }
+      } catch (cacheError) {
+        console.warn('Error checking cached blocks:', cacheError);
+      }
+      
+      // Query Firestore
+      const blockQuery = await firestore()
+        .collection('userBlocks')
+        .where('blockedBy', '==', blockedBy)
+        .where('blockedUser', '==', potentiallyBlockedUser)
+        .limit(1)
+        .get();
+        
+      return !blockQuery.empty;
+    } catch (error) {
+      console.error('Error checking block status:', error);
       return false;
     }
   }
