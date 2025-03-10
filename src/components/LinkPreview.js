@@ -1,161 +1,141 @@
 // src/components/LinkPreview.js
-// Component for displaying rich link previews in posts
-
 import React, { useState, useEffect } from 'react';
 import {
   View,
   Text,
-  StyleSheet,
+  Image,
   TouchableOpacity,
-  Linking,
-  ActivityIndicator
+  StyleSheet,
+  ActivityIndicator,
+  Dimensions,
 } from 'react-native';
 import FastImage from 'react-native-fast-image';
-import Icon from 'react-native-vector-icons/Ionicons';
-import { AccessibleImage } from './AccessibleImage';
-import { getDomainFromUrl } from '../utils/firebaseUtils';
+import { getLinkPreview } from 'react-native-link-preview';
+import Icon from 'react-native-vector-icons/Feather';
+import SocialMediaUtils from '../utils/socialMediaUtils';
+import { useTheme } from '../theme/ThemeContext';
 
-const LinkPreview = ({ url, style }) => {
+const { width } = Dimensions.get('window');
+
+const LinkPreview = ({ url, onPress, style }) => {
+  const [previewData, setPreviewData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [linkData, setLinkData] = useState(null);
-  const [imageError, setImageError] = useState(false);
+  const [socialPlatform, setSocialPlatform] = useState(null);
+  const { theme } = useTheme();
 
-  // Fetch link preview data when component mounts
   useEffect(() => {
     if (!url) {
-      setError('No URL provided');
       setLoading(false);
       return;
     }
 
-    fetchLinkPreview();
+    // Detect if this is a social media URL
+    const platform = SocialMediaUtils.detectPlatform(url);
+    setSocialPlatform(platform);
+
+    // Fetch preview data
+    const fetchPreviewData = async () => {
+      try {
+        setLoading(true);
+        
+        const data = await getLinkPreview(url, {
+          timeout: 5000,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+          },
+        });
+        
+        setPreviewData(data);
+        setError(null);
+      } catch (err) {
+        console.error('Error fetching link preview:', err);
+        setError('Could not load preview');
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchPreviewData();
   }, [url]);
 
-  // Fetch link preview metadata
-  const fetchLinkPreview = async () => {
-    try {
-      setLoading(true);
-      setError(null);
+  // If no URL is provided, don't render anything
+  if (!url) {
+    return null;
+  }
 
-      // Ensure URL has protocol
-      let formattedUrl = url;
-      if (!/^https?:\/\//i.test(url)) {
-        formattedUrl = 'https://' + url;
-      }
-
-      // Use a link preview service or API
-      // Note: In a production app, you'd want to use a service like
-      // LinkPreview.io, Microlink, or your own backend proxy
-      const response = await fetch(`https://api.linkpreview.net/?key=YOUR_API_KEY&q=${encodeURIComponent(formattedUrl)}`);
-      
-      if (!response.ok) {
-        throw new Error('Failed to fetch link preview');
-      }
-
-      const data = await response.json();
-      
-      setLinkData({
-        title: data.title || 'No title',
-        description: data.description || 'No description available',
-        image: data.image,
-        url: data.url,
-        domain: getDomainFromUrl(data.url)
-      });
-    } catch (error) {
-      console.error('Error fetching link preview:', error);
-      
-      // Fallback to basic preview
-      setLinkData({
-        title: 'Link Preview',
-        description: 'Click to open link',
-        image: null,
-        url: formattedUrl,
-        domain: getDomainFromUrl(formattedUrl)
-      });
-      
-      setError('Failed to load link preview');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // Handle opening the link
-  const handleOpenLink = () => {
-    if (!linkData?.url) return;
-    
-    Linking.canOpenURL(linkData.url)
-      .then((supported) => {
-        if (supported) {
-          return Linking.openURL(linkData.url);
-        } else {
-          console.error('Cannot open URL:', linkData.url);
-        }
-      })
-      .catch((error) => {
-        console.error('Error opening URL:', error);
-      });
-  };
-
-  // Show loading state
+  // While loading, show a loading indicator
   if (loading) {
     return (
-      <View style={[styles.container, styles.loadingContainer, style]}>
-        <ActivityIndicator size="small" color="#2196F3" />
-        <Text style={styles.loadingText}>Loading link preview...</Text>
+      <View style={[styles.container, style, { height: 100, justifyContent: 'center' }]}>
+        <ActivityIndicator size="small" color={theme?.colors?.primary?.main || '#007AFF'} />
       </View>
     );
   }
 
-  // Show error state
-  if (error && !linkData) {
+  // If there was an error or no preview data, show a simple link
+  if (error || !previewData) {
     return (
-      <TouchableOpacity 
-        style={[styles.container, styles.errorContainer, style]}
-        onPress={() => Linking.openURL(url)}
+      <TouchableOpacity
+        style={[styles.errorContainer, style]}
+        onPress={() => onPress && onPress(url)}
       >
-        <Icon name="link-outline" size={24} color="#F44336" />
-        <Text style={styles.errorText}>Could not load preview</Text>
-        <Text style={styles.urlText}>{url}</Text>
+        <Icon name="link" size={16} color={theme?.colors?.primary?.main || '#007AFF'} />
+        <Text style={[styles.errorText, { color: theme?.colors?.primary?.main || '#007AFF' }]} numberOfLines={1}>
+          {url}
+        </Text>
       </TouchableOpacity>
     );
   }
 
+  // Determine what icon to show based on social platform
+  const renderPlatformIcon = () => {
+    if (!socialPlatform) return null;
+
+    return (
+      <View style={[styles.platformIcon, { backgroundColor: socialPlatform.color }]}>
+        <Icon name={socialPlatform.icon} size={14} color="#FFFFFF" />
+      </View>
+    );
+  };
+
+  // Render the preview
   return (
-    <TouchableOpacity 
+    <TouchableOpacity
       style={[styles.container, style]}
-      onPress={handleOpenLink}
-      accessibilityLabel={`Link to ${linkData?.title}. Tap to open.`}
-      accessibilityRole="link"
+      onPress={() => onPress && onPress(url)}
+      activeOpacity={0.8}
     >
-      {!imageError && linkData?.image && (
-        <View style={styles.imageContainer}>
-          <AccessibleImage
-            source={{ uri: linkData.image }}
-            style={styles.image}
-            contentDescription={`Preview image for ${linkData.title}`}
-            onError={() => setImageError(true)}
-          />
-        </View>
-      )}
-      
+      {renderPlatformIcon()}
+
       <View style={styles.contentContainer}>
-        <Text style={styles.domain}>{linkData?.domain}</Text>
-        <Text 
-          style={styles.title}
-          numberOfLines={2}
-          ellipsizeMode="tail"
-        >
-          {linkData?.title}
-        </Text>
-        
-        <Text 
-          style={styles.description}
-          numberOfLines={2}
-          ellipsizeMode="tail"
-        >
-          {linkData?.description}
-        </Text>
+        <View style={styles.textContainer}>
+          <Text style={[styles.title, { color: theme?.colors?.text?.primary || '#000000' }]} numberOfLines={2}>
+            {previewData.title || 'No title'}
+          </Text>
+          
+          {previewData.description && (
+            <Text style={[styles.description, { color: theme?.colors?.text?.secondary || '#666666' }]} numberOfLines={2}>
+              {previewData.description}
+            </Text>
+          )}
+          
+          <Text style={[styles.url, { color: theme?.colors?.text?.disabled || '#999999' }]} numberOfLines={1}>
+            {previewData.url}
+          </Text>
+        </View>
+
+        {previewData.images && previewData.images.length > 0 ? (
+          <FastImage
+            style={styles.image}
+            source={{ uri: previewData.images[0] }}
+            resizeMode={FastImage.resizeMode.cover}
+          />
+        ) : (
+          <View style={[styles.placeholderImage, { backgroundColor: theme?.colors?.background?.default || '#EEEEEE' }]}>
+            <Icon name="image" size={24} color={theme?.colors?.text?.disabled || '#999999'} />
+          </View>
+        )}
       </View>
     </TouchableOpacity>
   );
@@ -163,65 +143,73 @@ const LinkPreview = ({ url, style }) => {
 
 const styles = StyleSheet.create({
   container: {
-    borderWidth: 1,
-    borderColor: '#CFD8DC',
-    borderRadius: 8,
-    overflow: 'hidden',
+    borderRadius: 12,
     backgroundColor: '#FFFFFF',
-  },
-  loadingContainer: {
-    padding: 16,
-    alignItems: 'center',
-    justifyContent: 'center',
-    minHeight: 100,
-  },
-  loadingText: {
-    marginTop: 8,
-    color: '#546E7A',
-    fontSize: 14,
-  },
-  errorContainer: {
-    padding: 16,
-    alignItems: 'center',
-    justifyContent: 'center',
-    minHeight: 100,
-  },
-  errorText: {
-    marginTop: 8,
-    color: '#F44336',
-    fontSize: 14,
-    fontWeight: '500',
-  },
-  urlText: {
-    marginTop: 4,
-    color: '#78909C',
-    fontSize: 12,
-  },
-  imageContainer: {
-    width: '100%',
-    height: 150,
-  },
-  image: {
-    width: '100%',
-    height: '100%',
+    shadowColor: '#000000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 2,
+    overflow: 'hidden',
+    marginVertical: 8,
+    borderWidth: 1,
+    borderColor: '#EEEEEE',
   },
   contentContainer: {
+    flexDirection: 'row',
     padding: 12,
   },
-  domain: {
-    fontSize: 12,
-    color: '#78909C',
-    marginBottom: 4,
+  textContainer: {
+    flex: 1,
+    marginRight: 12,
+    justifyContent: 'space-between',
   },
   title: {
     fontSize: 16,
-    fontWeight: 'bold',
-    color: '#263238',
+    fontWeight: '600',
     marginBottom: 4,
   },
   description: {
     fontSize: 14,
-    color: '#546E7A',
+    marginBottom: 4,
+  },
+  url: {
+    fontSize: 12,
+  },
+  image: {
+    width: 80,
+    height: 80,
+    borderRadius: 8,
+    backgroundColor: '#EEEEEE',
+  },
+  placeholderImage: {
+    width: 80,
+    height: 80,
+    borderRadius: 8,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  errorContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    padding: 12,
+    backgroundColor: '#F5F5F5',
+    borderRadius: 8,
+  },
+  errorText: {
+    marginLeft: 8,
+    fontSize: 14,
+  },
+  platformIcon: {
+    position: 'absolute',
+    top: 8,
+    right: 8,
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    justifyContent: 'center',
+    alignItems: 'center',
+    zIndex: 10,
   },
 });
 
