@@ -1,338 +1,280 @@
 // src/utils/deepLinking.js
-// Enhanced deep linking with better error handling and analytics
+// Enhanced deep linking support for handling URLs across the app
 
-import { Linking } from 'react-native';
-import Config from 'react-native-config';
+import { Linking, Platform } from 'react-native';
 import { AnalyticsService } from '../services/AnalyticsService';
+import Config from 'react-native-config';
+import navigationService from '../services/NavigationService';
 
-// Define deep link mapping structure
-const DEEP_LINK_MAPPING = {
-  'post': {
-    path: 'posts/:postId',
-    screen: 'PostDetails',
-    parseParams: params => ({
-      postId: params.postId,
-    }),
-  },
-  'user': {
-    path: 'users/:userId',
-    screen: 'UserProfile',
-    parseParams: params => ({
-      userId: params.userId,
-      initialTab: params.tab || 'posts',
-    }),
-  },
-  'event': {
-    path: 'events/:eventId',
-    screen: 'EventDetails',
-    parseParams: params => ({
-      eventId: params.eventId,
-    }),
-  },
-  'chat': {
-    path: 'chats/:chatId',
-    screen: 'ChatScreen',
-    parseParams: params => ({
-      chatId: params.chatId,
-    }),
-  },
-  'message': {
-    path: 'messages/:messageId',
-    screen: 'MessageDetails',
-    parseParams: params => ({
-      messageId: params.messageId,
-      chatId: params.chatId,
-    }),
-  },
-  'settings': {
-    path: 'settings/:section?',
-    screen: 'Settings',
-    parseParams: params => ({
-      section: params.section || 'general',
-    }),
-  },
-  'reset-password': {
-    path: 'reset-password',
-    screen: 'ResetPassword',
-    parseParams: params => ({
-      token: params.token,
-      email: params.email,
-    }),
-  },
-  'invite': {
-    path: 'invite/:inviteCode',
-    screen: 'InviteScreen',
-    parseParams: params => ({
-      inviteCode: params.inviteCode,
-    }),
-  },
-  'share': {
-    path: 'share/:type/:id',
-    screen: 'SharedContent',
-    parseParams: params => ({
-      contentType: params.type,
-      contentId: params.id,
-    }),
-  },
-};
-
-// Get the domain from config or use default
+// Get the deep link domain from config or use a default
 const DEEP_LINK_DOMAIN = Config.DEEP_LINK_DOMAIN || 'healthconnect.app';
-const DEEP_LINK_SCHEME = __DEV__ ? 'healthconnectdev' : 'healthconnect';
-const DEEP_LINK_PREFIX_HTTPS = `https://${DEEP_LINK_DOMAIN}/`;
-const DEEP_LINK_PREFIX_APP = `${DEEP_LINK_SCHEME}://`;
+const APP_SCHEME = Config.APP_SCHEME || 'healthconnect://';
 
 /**
- * Parse and validate a deep link URL
- * @param {string} url The deep link URL to parse
- * @returns {object|null} Parsed link data or null if invalid
+ * Parse a deep link URL into structured data
+ * @param {string} url - The deep link URL
+ * @returns {Object} Parsed deep link data
  */
 export const parseDeepLink = (url) => {
+  if (!url) return null;
+  
   try {
-    if (!url) return null;
+    let path, queryParams = {};
     
-    // Determine if it's a web URL or app scheme
-    let path;
-    let isHttps = false;
-    
-    if (url.startsWith(DEEP_LINK_PREFIX_HTTPS)) {
-      path = url.substring(DEEP_LINK_PREFIX_HTTPS.length);
-      isHttps = true;
-    } else if (url.startsWith(DEEP_LINK_PREFIX_APP)) {
-      path = url.substring(DEEP_LINK_PREFIX_APP.length);
+    // Handle different URL formats (universal links vs custom scheme)
+    if (url.startsWith('http://') || url.startsWith('https://')) {
+      // Universal link format (https://healthconnect.app/...)
+      const parsedUrl = new URL(url);
+      
+      // Extract the path without leading slash
+      path = parsedUrl.pathname.replace(/^\/+/, '');
+      
+      // Parse query parameters
+      parsedUrl.searchParams.forEach((value, key) => {
+        queryParams[key] = value;
+      });
+    } else if (url.startsWith(APP_SCHEME)) {
+      // Custom URL scheme (healthconnect://...)
+      const cleanUrl = url.replace(APP_SCHEME, '');
+      
+      // Split path and query string
+      const [pathPart, queryPart] = cleanUrl.split('?');
+      path = pathPart;
+      
+      // Parse query parameters if they exist
+      if (queryPart) {
+        queryPart.split('&').forEach(param => {
+          const [key, value] = param.split('=');
+          if (key && value) {
+            queryParams[key] = decodeURIComponent(value);
+          }
+        });
+      }
     } else {
-      // Not a valid deep link for this app
+      // Unrecognized URL format
       return null;
     }
     
-    // Extract query parameters
-    const queryParamIndex = path.indexOf('?');
-    let queryParams = {};
+    // Split path into segments
+    const segments = path.split('/').filter(Boolean);
     
-    if (queryParamIndex >= 0) {
-      const queryString = path.substring(queryParamIndex + 1);
-      path = path.substring(0, queryParamIndex);
-      
-      // Parse query string into object
-      queryParams = queryString.split('&').reduce((params, param) => {
-        const [key, value] = param.split('=');
-        if (key && value) {
-          params[decodeURIComponent(key)] = decodeURIComponent(value);
-        }
-        return params;
-      }, {});
+    if (segments.length === 0) {
+      return null;
     }
     
-    // Remove trailing slash if present
-    if (path.endsWith('/')) {
-      path = path.slice(0, -1);
-    }
+    // Determine the type of deep link based on the first path segment
+    const type = segments[0];
+    const id = segments.length > 1 ? segments[1] : null;
     
-    // Find matching route
-    for (const [key, routeConfig] of Object.entries(DEEP_LINK_MAPPING)) {
-      const pathPattern = routeConfig.path;
-      const pathSegments = pathPattern.split('/');
-      const urlSegments = path.split('/');
-      
-      // Skip if segment count doesn't match (unless there are optional params)
-      if (!pathPattern.includes('?') && pathSegments.length !== urlSegments.length) {
-        continue;
-      }
-      
-      let isMatch = true;
-      const routeParams = {};
-      
-      // Compare each segment
-      for (let i = 0; i < pathSegments.length; i++) {
-        const patternSegment = pathSegments[i];
-        const urlSegment = urlSegments[i];
-        
-        // If this is a parameter segment (starts with :)
-        if (patternSegment.startsWith(':')) {
-          const paramName = patternSegment.substring(1);
-          // Check if optional (ends with ?)
-          const isOptional = paramName.endsWith('?');
-          const cleanParamName = isOptional ? paramName.slice(0, -1) : paramName;
-          
-          // If parameter is present in URL, add it to route params
-          if (urlSegment) {
-            routeParams[cleanParamName] = urlSegment;
-          } else if (!isOptional) {
-            // Required parameter is missing
-            isMatch = false;
-            break;
-          }
-        } else if (patternSegment !== urlSegment) {
-          // Static segment doesn't match
-          isMatch = false;
-          break;
-        }
-      }
-      
-      if (isMatch) {
-        // We found a matching route
-        const screen = routeConfig.screen;
-        let params = {};
-        
-        // Combine route params and query params
-        const combinedParams = { ...routeParams, ...queryParams };
-        
-        // Use custom param parser if provided
-        if (routeConfig.parseParams) {
-          params = routeConfig.parseParams(combinedParams);
-        } else {
-          params = combinedParams;
-        }
-        
-        return {
-          type: key,
-          screen,
-          params,
-          url,
-          isHttps,
-        };
-      }
-    }
-    
-    // No matching route found
-    return null;
+    return {
+      type,
+      id,
+      segments,
+      queryParams,
+      originalUrl: url
+    };
   } catch (error) {
-    console.error('Error parsing deep link:', error, url);
-    AnalyticsService.logError(error, { 
-      context: 'parse_deep_link', 
-      url 
-    });
+    console.error('Error parsing deep link:', error);
+    AnalyticsService.logError(error, { context: 'parse_deep_link', url });
     return null;
   }
 };
 
 /**
- * Initialize deep linking event listeners
- * @param {object} navigation A navigation object with navigate method
- * @returns {function} Cleanup function to call on unmount
+ * Handle a deep link URL
+ * @param {string} url - The deep link URL
+ * @returns {boolean} Whether the deep link was handled
+ */
+export const handleDeepLink = (url) => {
+  try {
+    if (!url) return false;
+    
+    // Parse the deep link
+    const parsedLink = parseDeepLink(url);
+    
+    if (!parsedLink) return false;
+    
+    // Log the deep link for analytics
+    AnalyticsService.logEvent('deep_link_opened', {
+      type: parsedLink.type,
+      hasId: !!parsedLink.id,
+      url
+    });
+    
+    // Handle different deep link types
+    switch (parsedLink.type) {
+      case 'post': 
+        if (parsedLink.id) {
+          navigationService.navigate('PostDetails', { postId: parsedLink.id });
+          return true;
+        }
+        break;
+        
+      case 'profile':
+        if (parsedLink.id) {
+          navigationService.navigate('ProfileScreen', { userId: parsedLink.id });
+          return true;
+        }
+        break;
+        
+      case 'event':
+        if (parsedLink.id) {
+          navigationService.navigate('EventDetails', { eventId: parsedLink.id });
+          return true;
+        }
+        break;
+        
+      case 'reset-password':
+        if (parsedLink.id) {
+          navigationService.navigate('ResetPassword', { token: parsedLink.id });
+          return true;
+        }
+        break;
+        
+      case 'share':
+        // Handle share URLs
+        if (parsedLink.segments.length > 2) {
+          const shareType = parsedLink.segments[1];
+          const shareId = parsedLink.segments[2];
+          
+          switch (shareType) {
+            case 'post':
+              navigationService.navigate('PostDetails', { postId: shareId });
+              return true;
+              
+            case 'event':
+              navigationService.navigate('EventDetails', { eventId: shareId });
+              return true;
+              
+            case 'profile':
+              navigationService.navigate('ProfileScreen', { userId: shareId });
+              return true;
+          }
+        }
+        break;
+        
+      case 'notification':
+        // Handle deep links from notifications
+        if (parsedLink.id) {
+          navigationService.navigate('NotificationDetails', { notificationId: parsedLink.id });
+          return true;
+        }
+        break;
+        
+      case 'settings':
+        // Navigate to specific settings screens
+        if (parsedLink.segments.length > 1) {
+          const settingType = parsedLink.segments[1];
+          
+          switch (settingType) {
+            case 'profile':
+              navigationService.navigate('ProfileSettings');
+              return true;
+              
+            case 'privacy':
+              navigationService.navigate('PrivacySettings');
+              return true;
+              
+            case 'notifications':
+              navigationService.navigate('NotificationSettings');
+              return true;
+              
+            case 'account':
+              navigationService.navigate('AccountSettings');
+              return true;
+          }
+        } else {
+          // Navigate to main settings
+          navigationService.navigate('Settings');
+          return true;
+        }
+        break;
+    }
+    
+    return false;
+  } catch (error) {
+    console.error('Error handling deep link:', error);
+    AnalyticsService.logError(error, { context: 'handle_deep_link', url });
+    return false;
+  }
+};
+
+/**
+ * Initialize deep linking listeners
+ * @param {object} navigation - React Navigation reference
+ * @returns {function} Cleanup function
  */
 export const initializeDeepLinking = (navigation) => {
-  if (!navigation) {
-    throw new Error('Navigation object is required for deep linking');
-  }
+  // Store initial URL
+  let initialUrl = null;
   
-  /**
-   * Handle received deep link
-   * @param {object} event Linking event with url property
-   */
-  const handleDeepLink = (event) => {
-    try {
-      const url = event.url || event;
-      const linkData = parseDeepLink(url);
-      
-      if (linkData) {
-        // Log deep link navigation
-        AnalyticsService.logEvent('deep_link_opened', {
-          url,
-          type: linkData.type,
-          screen: linkData.screen,
-          params: JSON.stringify(linkData.params),
-        });
-        
-        // Navigate to the appropriate screen
-        navigation.navigate(linkData.screen, linkData.params);
-        
-        return true;
-      } else {
-        console.warn('No matching route found for deep link:', url);
-        
-        // Log unmatched deep link
-        AnalyticsService.logEvent('deep_link_unmatched', {
-          url,
-        });
-        
-        return false;
-      }
-    } catch (error) {
-      console.error('Error handling deep link:', error);
-      AnalyticsService.logError(error, { 
-        context: 'handle_deep_link',
-        url: event.url || event,
-      });
-      return false;
+  // Handle incoming links when app is already running
+  const linkingSubscription = Linking.addEventListener('url', ({ url }) => {
+    handleDeepLink(url);
+  });
+  
+  // Check for initial URL that launched the app
+  Linking.getInitialURL().then(url => {
+    initialUrl = url;
+    if (url) {
+      handleDeepLink(url);
     }
-  };
-  
-  // Listen for incoming links when app is already running
-  const eventListener = Linking.addEventListener('url', handleDeepLink);
-  
-  // Check for any pending initial URL that launched the app
-  Linking.getInitialURL()
-    .then(url => {
-      if (url) {
-        handleDeepLink(url);
-      }
-    })
-    .catch(error => {
-      console.error('Error getting initial URL:', error);
-      AnalyticsService.logError(error, { context: 'get_initial_url' });
-    });
+  }).catch(error => {
+    console.error('Error getting initial URL:', error);
+    AnalyticsService.logError(error, { context: 'get_initial_url' });
+  });
   
   // Return cleanup function
   return () => {
-    if (eventListener && typeof eventListener.remove === 'function') {
-      eventListener.remove();
-    }
+    linkingSubscription.remove();
   };
 };
 
 /**
- * Clean up deep linking event listeners
+ * Clean up deep linking
  */
 export const cleanupDeepLinking = () => {
-  Linking.removeAllListeners('url');
+  // This is just a placeholder function for now
+  // In the future, we might need to do more cleanup here
 };
 
 /**
- * Generate a deep link for sharing
- * @param {string} type The type of content (must be defined in DEEP_LINK_MAPPING)
- * @param {object} params Parameters for the deep link
- * @param {boolean} useHttps Whether to use HTTPS links (default) or app scheme
- * @returns {string|null} Generated deep link URL or null if invalid
+ * Generate a deep link URL
+ * @param {string} type - Type of content
+ * @param {string} id - Content ID
+ * @param {object} params - Additional parameters
+ * @returns {string} Deep link URL
  */
-export const generateDeepLink = (type, params = {}, useHttps = true) => {
+export const generateDeepLink = (type, id, params = {}) => {
   try {
-    // Validate the type
-    const routeConfig = DEEP_LINK_MAPPING[type];
-    if (!routeConfig) {
-      console.error(`Invalid deep link type: ${type}`);
-      return null;
+    // Use https for universal links
+    let url = `https://${DEEP_LINK_DOMAIN}/${type}`;
+    
+    if (id) {
+      url += `/${id}`;
     }
     
-    // Start with the path pattern
-    let path = routeConfig.path;
-    
-    // Replace route parameters in the path
-    for (const [key, value] of Object.entries(params)) {
-      const paramPattern = `:${key}`;
-      const optionalParamPattern = `:${key}?`;
+    // Add query parameters
+    if (Object.keys(params).length > 0) {
+      const queryString = Object.entries(params)
+        .map(([key, value]) => `${key}=${encodeURIComponent(value)}`)
+        .join('&');
       
-      if (path.includes(paramPattern)) {
-        path = path.replace(paramPattern, encodeURIComponent(value));
-      } else if (path.includes(optionalParamPattern)) {
-        path = path.replace(optionalParamPattern, encodeURIComponent(value));
-      }
+      url += `?${queryString}`;
     }
     
-    // Remove any remaining optional parameters
-    path = path.replace(/\/:[^\/]+\?/g, '');
-    
-    // Generate the full URL with appropriate prefix
-    const prefix = useHttps ? DEEP_LINK_PREFIX_HTTPS : DEEP_LINK_PREFIX_APP;
-    
-    return `${prefix}${path}`;
+    return url;
   } catch (error) {
     console.error('Error generating deep link:', error);
-    AnalyticsService.logError(error, { 
-      context: 'generate_deep_link',
-      type,
-      params: JSON.stringify(params),
-    });
+    AnalyticsService.logError(error, { context: 'generate_deep_link' });
     return null;
   }
+};
+
+export default {
+  parseDeepLink,
+  handleDeepLink,
+  initializeDeepLinking,
+  cleanupDeepLinking,
+  generateDeepLink
 };
