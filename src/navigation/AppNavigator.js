@@ -1,20 +1,18 @@
 // src/navigation/AppNavigator.js
-// Enhanced navigation system with shared element transitions
+// Consolidated navigation system with shared element transitions
 
-import React from 'react';
+import React, { useEffect } from 'react';
 import { Platform, StatusBar } from 'react-native';
-import { NavigationContainer } from '@react-navigation/native';
 import { createSharedElementStackNavigator } from 'react-navigation-shared-element';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { enableScreens } from 'react-native-screens';
 import Icon from 'react-native-vector-icons/Ionicons';
 import { useTheme } from '../theme/ThemeContext';
+import Config from 'react-native-config';
+import { useNetwork } from '../contexts/NetworkContext';
 
 // Import screens
-import OnboardingScreen from '../screens/OnboardingScreen';
-import LoginScreen from '../screens/LoginScreen';
-import RegistrationScreen from '../screens/RegistrationScreen';
 import FeedScreen from '../screens/FeedScreen';
 import ExploreScreen from '../screens/ExploreScreen';
 import NewPostScreen from '../screens/NewPostScreen';
@@ -30,6 +28,7 @@ import EventDetailScreen from '../screens/EventDetailScreen';
 import ChatListScreen from '../screens/ChatListScreen';
 import ChatScreen from '../screens/ChatScreen';
 import SearchScreen from '../screens/SearchScreen';
+import BlockedUsersScreen from '../screens/BlockedUsersScreen';
 
 // Enable react-native-screens for better performance
 enableScreens();
@@ -38,30 +37,8 @@ enableScreens();
 const Stack = createSharedElementStackNavigator();
 const Tab = createBottomTabNavigator();
 
-// Auth stack navigator (onboarding, login, register)
-const AuthNavigator = () => {
-  return (
-    <Stack.Navigator 
-      screenOptions={{ 
-        headerShown: false,
-        cardStyleInterpolator: ({ current: { progress } }) => {
-          return {
-            cardStyle: {
-              opacity: progress,
-            },
-          };
-        },
-      }}
-    >
-      <Stack.Screen name="Onboarding" component={OnboardingScreen} />
-      <Stack.Screen name="Login" component={LoginScreen} />
-      <Stack.Screen name="Registration" component={RegistrationScreen} />
-    </Stack.Navigator>
-  );
-};
-
 // Feed stack navigator
-const FeedStackNavigator = () => {
+const FeedStack = () => {
   const { theme } = useTheme();
   
   return (
@@ -148,7 +125,7 @@ const FeedStackNavigator = () => {
 };
 
 // Explore stack navigator
-const ExploreStackNavigator = () => {
+const ExploreStack = () => {
   const { theme } = useTheme();
   
   return (
@@ -195,7 +172,7 @@ const ExploreStackNavigator = () => {
 };
 
 // Events stack navigator
-const EventsStackNavigator = () => {
+const EventsStack = () => {
   const { theme } = useTheme();
   
   return (
@@ -234,7 +211,7 @@ const EventsStackNavigator = () => {
 };
 
 // Profile stack navigator
-const ProfileStackNavigator = () => {
+const ProfileStack = () => {
   const { theme } = useTheme();
   
   return (
@@ -281,6 +258,14 @@ const ProfileStackNavigator = () => {
         }}
       />
       <Stack.Screen 
+        name="BlockedUsers" 
+        component={BlockedUsersScreen} 
+        options={{ 
+          title: 'Blocked Users',
+          headerBackTitleVisible: false,
+        }}
+      />
+      <Stack.Screen 
         name="PostDetail" 
         component={PostDetailScreen} 
         options={{ 
@@ -297,7 +282,7 @@ const ProfileStackNavigator = () => {
 };
 
 // Chat stack navigator
-const ChatStackNavigator = () => {
+const ChatStack = () => {
   const { theme } = useTheme();
   
   return (
@@ -343,9 +328,71 @@ const ChatStackNavigator = () => {
   );
 };
 
-// Main tab navigator for authenticated users
-const MainTabNavigator = () => {
+// Notifications stack navigator
+const NotificationsStack = () => {
   const { theme } = useTheme();
+  
+  return (
+    <Stack.Navigator
+      screenOptions={{
+        headerTintColor: theme.colors.text.primary,
+        headerStyle: {
+          backgroundColor: theme.colors.background.paper,
+          elevation: 0,
+          shadowOpacity: 0,
+          borderBottomWidth: 1,
+          borderBottomColor: theme.colors.divider,
+        },
+        cardStyle: { backgroundColor: theme.colors.background.default },
+      }}
+    >
+      <Stack.Screen 
+        name="Notifications" 
+        component={NotificationsScreen} 
+        options={{ title: 'Notifications' }}
+      />
+      <Stack.Screen 
+        name="UserProfile" 
+        component={UserProfileScreen} 
+        options={({ route }) => ({ 
+          title: route.params?.title || 'Profile',
+          headerBackTitleVisible: false,
+        })}
+      />
+      <Stack.Screen 
+        name="PostDetail" 
+        component={PostDetailScreen} 
+        options={{ 
+          title: 'Post',
+          headerBackTitleVisible: false,
+        }}
+      />
+    </Stack.Navigator>
+  );
+};
+
+// Main tab navigator for authenticated users
+const AppNavigator = ({ route }) => {
+  const { theme, isDarkMode } = useTheme();
+  const { isConnected, isInternetReachable } = useNetwork();
+  const { offlineMode } = route.params || {};
+  
+  // Update status bar based on theme
+  useEffect(() => {
+    StatusBar.setBarStyle(isDarkMode ? 'light-content' : 'dark-content');
+    if (Platform.OS === 'android') {
+      StatusBar.setBackgroundColor(theme.colors.background.paper);
+    }
+  }, [isDarkMode, theme]);
+  
+  // Conditionally disable certain tabs when offline
+  const isOffline = !isConnected || !isInternetReachable || offlineMode;
+  
+  // Event tab only available if enabled in config and online
+  const eventTabEnabled = Config.ENABLE_EVENTS === 'true' && !isOffline;
+  
+  // Chat tab only available if enabled in config and online
+  const chatTabEnabled = Config.ENABLE_CHAT === 'true' && !isOffline;
   
   return (
     <Tab.Navigator
@@ -363,6 +410,8 @@ const MainTabNavigator = () => {
             iconName = focused ? 'chatbubbles' : 'chatbubbles-outline';
           } else if (route.name === 'EventsTab') {
             iconName = focused ? 'calendar' : 'calendar-outline';
+          } else if (route.name === 'NotificationsTab') {
+            iconName = focused ? 'notifications' : 'notifications-outline';
           } else if (route.name === 'ProfileTab') {
             iconName = focused ? 'person' : 'person-outline';
           }
@@ -388,19 +437,21 @@ const MainTabNavigator = () => {
     >
       <Tab.Screen 
         name="FeedTab" 
-        component={FeedStackNavigator} 
+        component={FeedStack} 
         options={{ tabBarLabel: 'Feed' }}
       />
       <Tab.Screen 
         name="ExploreTab" 
-        component={ExploreStackNavigator} 
+        component={ExploreStack} 
         options={{ tabBarLabel: 'Discover' }}
       />
-      <Tab.Screen 
-        name="EventsTab" 
-        component={EventsStackNavigator} 
-        options={{ tabBarLabel: 'Events' }}
-      />
+      {eventTabEnabled && (
+        <Tab.Screen 
+          name="EventsTab" 
+          component={EventsStack} 
+          options={{ tabBarLabel: 'Events' }}
+        />
+      )}
       <Tab.Screen 
         name="NewPost" 
         component={NewPostScreen} 
@@ -418,51 +469,25 @@ const MainTabNavigator = () => {
           ),
         }}
       />
+      {chatTabEnabled && (
+        <Tab.Screen 
+          name="ChatTab" 
+          component={ChatStack} 
+          options={{ tabBarLabel: 'Chat' }}
+        />
+      )}
       <Tab.Screen 
-        name="ChatTab" 
-        component={ChatStackNavigator} 
-        options={{ tabBarLabel: 'Chat' }}
+        name="NotificationsTab" 
+        component={NotificationsStack} 
+        options={{ tabBarLabel: 'Notifications' }}
       />
       <Tab.Screen 
         name="ProfileTab" 
-        component={ProfileStackNavigator} 
+        component={ProfileStack} 
         options={{ tabBarLabel: 'Profile' }}
       />
     </Tab.Navigator>
   );
 };
 
-// Root navigator that handles authentication state
-export const AppNavigator = ({ isAuthenticated }) => {
-  const { theme } = useTheme();
-  
-  return (
-    <SafeAreaProvider>
-      <StatusBar
-        barStyle={theme.dark ? 'light-content' : 'dark-content'}
-        backgroundColor={theme.colors.background.paper}
-      />
-      <NavigationContainer theme={theme.navigation}>
-        {isAuthenticated ? (
-          <MainTabNavigator />
-        ) : (
-          <AuthNavigator />
-        )}
-      </NavigationContainer>
-    </SafeAreaProvider>
-  );
-};
-
-// package.json additions:
-// 
-// "dependencies": {
-//   ...
-//   "@react-navigation/native": "^6.1.9",
-//   "@react-navigation/bottom-tabs": "^6.5.11",
-//   "@react-navigation/stack": "^6.3.20",
-//   "react-native-screens": "^3.27.0",
-//   "react-native-safe-area-context": "^4.7.4",
-//   "react-native-shared-element": "^0.8.8",
-//   "react-navigation-shared-element": "^3.1.3",
-//   ...
-// }
+export default AppNavigator;
