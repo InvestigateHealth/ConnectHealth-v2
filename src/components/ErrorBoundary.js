@@ -1,12 +1,11 @@
 // src/components/ErrorBoundary.js
-// Error boundary component to catch unexpected errors in production
-
 import React, { Component } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, ScrollView, SafeAreaView, Platform } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, ScrollView, SafeAreaView } from 'react-native';
+import firestore from '@react-native-firebase/firestore';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import Icon from 'react-native-vector-icons/Ionicons';
-import { AnalyticsService } from '../services/AnalyticsService';
 import DeviceInfo from 'react-native-device-info';
+import NetInfo from '@react-native-community/netinfo';
+import { AnalyticsService } from '../services/AnalyticsService';
 
 class ErrorBoundary extends Component {
   constructor(props) {
@@ -15,8 +14,11 @@ class ErrorBoundary extends Component {
       hasError: false,
       error: null,
       errorInfo: null,
-      appVersion: '',
-      errorCount: 0,
+      deviceInfo: {},
+      networkInfo: {},
+      errorId: null,
+      isReporting: false,
+      reportSent: false,
     };
   }
 
@@ -25,278 +27,275 @@ class ErrorBoundary extends Component {
     return { hasError: true, error };
   }
 
-  async componentDidMount() {
-    // Get app version
-    const version = `${DeviceInfo.getVersion()} (${DeviceInfo.getBuildNumber()})`;
-    this.setState({ appVersion: version });
+  componentDidCatch(error, errorInfo) {
+    // Log the error to console
+    console.error('Application error:', error, errorInfo);
     
-    // Get error count from storage
-    try {
-      const errorCount = await AsyncStorage.getItem('@error_count');
-      if (errorCount !== null) {
-        this.setState({ errorCount: parseInt(errorCount, 10) });
-      }
-    } catch (error) {
-      console.error('Error reading error count from storage:', error);
-    }
+    // Collect device and network info
+    this.collectDiagnosticInfo(error, errorInfo);
   }
 
-  async componentDidCatch(error, errorInfo) {
-    // Log the error to analytics
-    AnalyticsService.logError(
-      error.toString(),
-      'unhandled_exception',
-      {
-        componentStack: errorInfo?.componentStack,
-        appVersion: this.state.appVersion,
-        errorCount: this.state.errorCount + 1,
-      }
-    );
-    
-    // Update error info state
-    this.setState({ errorInfo });
-    
-    // Increment error count
-    const newErrorCount = this.state.errorCount + 1;
-    this.setState({ errorCount: newErrorCount });
-    
-    // Save error count to storage
+  async collectDiagnosticInfo(error, errorInfo) {
     try {
-      await AsyncStorage.setItem('@error_count', newErrorCount.toString());
+      // Generate unique ID for this error
+      const errorId = `error_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
       
-      // Also log the error details for debugging
-      const errorLog = await AsyncStorage.getItem('@error_log') || '[]';
-      const errorLogs = JSON.parse(errorLog);
+      // Collect device information
+      const deviceInfo = {
+        appVersion: await DeviceInfo.getVersion(),
+        buildNumber: await DeviceInfo.getBuildNumber(),
+        deviceId: await DeviceInfo.getUniqueId(),
+        deviceModel: await DeviceInfo.getModel(),
+        deviceManufacturer: await DeviceInfo.getManufacturer(),
+        systemVersion: await DeviceInfo.getSystemVersion(),
+        isTablet: await DeviceInfo.isTablet(),
+        isEmulator: await DeviceInfo.isEmulator(),
+        carrier: await DeviceInfo.getCarrier(),
+        totalMemory: await DeviceInfo.getTotalMemory(),
+        freeDiskStorage: await DeviceInfo.getFreeDiskStorage(),
+        timezone: await DeviceInfo.getTimezone(),
+        locale: await DeviceInfo.getDeviceLocale(),
+      };
       
-      errorLogs.push({
-        timestamp: new Date().toISOString(),
-        error: error.toString(),
-        componentStack: errorInfo?.componentStack,
-        appVersion: this.state.appVersion,
+      // Collect network information
+      const networkInfo = await NetInfo.fetch();
+      
+      // Update state with all diagnostic info
+      this.setState({
+        errorInfo,
+        deviceInfo,
+        networkInfo,
+        errorId,
       });
       
-      // Keep only the last 10 errors
-      const recentErrors = errorLogs.slice(-10);
-      await AsyncStorage.setItem('@error_log', JSON.stringify(recentErrors));
-    } catch (storageError) {
-      console.error('Error saving error details to storage:', storageError);
+      // Log error to analytics
+      AnalyticsService.logEvent('app_error', {
+        error_message: error.message,
+        error_stack: error.stack,
+        error_id: errorId,
+        app_version: deviceInfo.appVersion,
+        build_number: deviceInfo.buildNumber,
+        device_model: deviceInfo.deviceModel,
+        system_version: deviceInfo.systemVersion,
+        is_connected: networkInfo.isConnected,
+      });
+      
+      // Save error details to local storage for recovery/reporting later if needed
+      await AsyncStorage.setItem(`error_${errorId}`, JSON.stringify({
+        timestamp: Date.now(),
+        error: {
+          message: error.message,
+          stack: error.stack,
+        },
+        errorInfo: {
+          componentStack: errorInfo.componentStack,
+        },
+        deviceInfo,
+        networkInfo,
+      }));
+    } catch (collectError) {
+      console.error('Error collecting diagnostic info:', collectError);
     }
   }
 
   resetError = async () => {
-    // Reset the error state
-    this.setState({ hasError: false, error: null, errorInfo: null });
-    
-    // Reset the component tree by force updating
-    this.forceUpdate();
-    
-    // Clear error logs in extreme cases
-    if (this.state.errorCount > 10) {
-      try {
-        await AsyncStorage.removeItem('@error_log');
-        await AsyncStorage.setItem('@error_count', '0');
-        this.setState({ errorCount: 0 });
-      } catch (error) {
-        console.error('Error clearing error logs:', error);
-      }
-    }
-  };
-
-  resetApp = async () => {
-    // Reset the app by clearing cache and storage
     try {
-      // Keep user authentication but clear caches
+      // Clear any cached state that might be causing the error
       const keys = await AsyncStorage.getAllKeys();
-      const keysToRemove = keys.filter(key => !key.startsWith('@auth_'));
-      await AsyncStorage.multiRemove(keysToRemove);
+      const stateCacheKeys = keys.filter(key => key.startsWith('state_cache_'));
       
-      // Reset error count
-      await AsyncStorage.setItem('@error_count', '0');
-      this.setState({ errorCount: 0 });
+      if (stateCacheKeys.length > 0) {
+        await AsyncStorage.multiRemove(stateCacheKeys);
+      }
       
-      // Force app reload
-      this.resetError();
-    } catch (error) {
-      console.error('Error resetting app:', error);
+      // Reset the error state
+      this.setState({
+        hasError: false,
+        error: null,
+        errorInfo: null,
+      });
+    } catch (resetError) {
+      console.error('Error resetting application:', resetError);
     }
-  };
+  }
+
+  reportError = async () => {
+    this.setState({ isReporting: true });
+    
+    try {
+      // Only submit if we have network
+      const networkState = await NetInfo.fetch();
+      
+      if (networkState.isConnected) {
+        // Send error report to Firestore
+        await firestore().collection('errorReports').add({
+          errorId: this.state.errorId,
+          timestamp: firestore.FieldValue.serverTimestamp(),
+          error: {
+            message: this.state?.error?.message || 'Unknown error',
+            stack: this.state?.error?.stack || '',
+          },
+          componentStack: this.state?.errorInfo?.componentStack || '',
+          deviceInfo: this.state.deviceInfo,
+          networkInfo: this.state.networkInfo,
+        });
+        
+        this.setState({ reportSent: true });
+      } else {
+        // Store for later submission when online
+        await AsyncStorage.setItem('pending_error_reports', JSON.stringify([
+          ...(JSON.parse(await AsyncStorage.getItem('pending_error_reports') || '[]')),
+          this.state.errorId
+        ]));
+      }
+    } catch (reportError) {
+      console.error('Error reporting crash:', reportError);
+    } finally {
+      this.setState({ isReporting: false });
+    }
+  }
 
   render() {
-    if (this.state.hasError) {
-      // If we're in development, show more detailed error
-      if (__DEV__) {
-        return (
-          <SafeAreaView style={styles.container}>
-            <ScrollView style={styles.scrollView} contentContainerStyle={styles.scrollContent}>
-              <View style={styles.errorHeader}>
-                <Icon name="alert-circle" size={60} color="#E53935" />
-                <Text style={styles.errorTitle}>Something went wrong</Text>
-              </View>
-              
-              <View style={styles.errorDetails}>
-                <Text style={styles.errorHeading}>Error:</Text>
-                <Text style={styles.errorText}>{this.state.error?.toString()}</Text>
-                
-                <Text style={styles.errorHeading}>Component Stack:</Text>
-                <ScrollView style={styles.stackContainer}>
-                  <Text style={styles.stackText}>
-                    {this.state.errorInfo?.componentStack}
-                  </Text>
-                </ScrollView>
-              </View>
-              
-              <View style={styles.actionsContainer}>
-                <TouchableOpacity 
-                  style={styles.actionButton} 
-                  onPress={this.resetError}
-                >
-                  <Text style={styles.actionButtonText}>Try Again</Text>
-                </TouchableOpacity>
-              </View>
-            </ScrollView>
-          </SafeAreaView>
-        );
-      }
-      
-      // In production, show a user-friendly error
-      return (
-        <SafeAreaView style={styles.container}>
-          <View style={styles.errorContainer}>
-            <Icon name="alert-circle" size={80} color="#E53935" />
-            <Text style={styles.errorTitle}>Oops! Something went wrong</Text>
-            <Text style={styles.errorMessage}>
-              We're sorry, but the app has encountered an unexpected error.
-            </Text>
-            
-            <View style={styles.actionsContainer}>
-              <TouchableOpacity 
-                style={styles.actionButton} 
-                onPress={this.resetError}
-              >
-                <Text style={styles.actionButtonText}>Try Again</Text>
-              </TouchableOpacity>
-              
-              <TouchableOpacity 
-                style={[styles.actionButton, styles.resetButton]} 
-                onPress={this.resetApp}
-              >
-                <Text style={styles.actionButtonText}>Reset App</Text>
-              </TouchableOpacity>
-            </View>
-            
-            <Text style={styles.versionText}>
-              Version: {this.state.appVersion}
-            </Text>
-            
-            <Text style={styles.errorCode}>
-              Error Code: {Math.abs(
-                this.state.error?.toString().split('').reduce(
-                  (acc, char) => acc + char.charCodeAt(0), 0
-                ) || 0
-              ) % 1000}
-            </Text>
-          </View>
-        </SafeAreaView>
-      );
+    const { hasError, error, isReporting, reportSent } = this.state;
+    
+    if (!hasError) {
+      return this.props.children;
     }
-
-    return this.props.children;
+    
+    // Render fallback UI
+    return (
+      <SafeAreaView style={styles.container}>
+        <ScrollView contentContainerStyle={styles.scrollContainer}>
+          <Text style={styles.title}>Something went wrong</Text>
+          
+          <Text style={styles.description}>
+            The application encountered an unexpected error. Please try restarting the app.
+            If the issue persists, please contact support.
+          </Text>
+          
+          {error && (
+            <View style={styles.errorContainer}>
+              <Text style={styles.errorTitle}>Error Details:</Text>
+              <Text style={styles.errorText}>{error.toString()}</Text>
+            </View>
+          )}
+          
+          <View style={styles.buttonsContainer}>
+            <TouchableOpacity 
+              style={[styles.button, styles.resetButton]} 
+              onPress={this.resetError}
+            >
+              <Text style={styles.buttonText}>Try Again</Text>
+            </TouchableOpacity>
+            
+            {!reportSent ? (
+              <TouchableOpacity 
+                style={[styles.button, styles.reportButton, isReporting && styles.disabledButton]} 
+                onPress={this.reportError}
+                disabled={isReporting}
+              >
+                <Text style={styles.buttonText}>
+                  {isReporting ? 'Sending...' : 'Report Issue'}
+                </Text>
+              </TouchableOpacity>
+            ) : (
+              <View style={[styles.button, styles.reportedButton]}>
+                <Text style={styles.buttonText}>Report Sent</Text>
+              </View>
+            )}
+          </View>
+          
+          {reportSent && (
+            <Text style={styles.thankYouText}>
+              Thank you for reporting this issue. Our team will investigate it.
+            </Text>
+          )}
+        </ScrollView>
+      </SafeAreaView>
+    );
   }
 }
 
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#F5F7F8',
+    backgroundColor: '#f8f9fa',
   },
-  scrollView: {
-    flex: 1,
-  },
-  scrollContent: {
+  scrollContainer: {
+    flexGrow: 1,
     padding: 20,
-  },
-  errorContainer: {
-    flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
-    padding: 20,
   },
-  errorHeader: {
-    alignItems: 'center',
-    marginBottom: 20,
-  },
-  errorTitle: {
+  title: {
     fontSize: 24,
     fontWeight: 'bold',
-    color: '#263238',
-    marginTop: 20,
-    marginBottom: 10,
+    color: '#dc3545',
+    marginBottom: 16,
     textAlign: 'center',
   },
-  errorMessage: {
+  description: {
     fontSize: 16,
-    color: '#546E7A',
+    color: '#212529',
+    marginBottom: 24,
     textAlign: 'center',
-    marginBottom: 30,
+    lineHeight: 22,
   },
-  errorDetails: {
-    backgroundColor: '#ECEFF1',
+  errorContainer: {
+    width: '100%',
+    backgroundColor: '#f8d7da',
     borderRadius: 8,
-    padding: 15,
-    marginBottom: 20,
+    padding: 16,
+    marginBottom: 24,
   },
-  errorHeading: {
+  errorTitle: {
     fontSize: 16,
     fontWeight: 'bold',
-    color: '#263238',
+    color: '#721c24',
     marginBottom: 8,
   },
   errorText: {
     fontSize: 14,
-    color: '#546E7A',
-    marginBottom: 15,
+    color: '#721c24',
   },
-  stackContainer: {
-    maxHeight: 200,
-    backgroundColor: '#CFD8DC',
-    borderRadius: 4,
-    padding: 8,
-  },
-  stackText: {
-    fontSize: 12,
-    color: '#37474F',
-    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
-  },
-  actionsContainer: {
+  buttonsContainer: {
     flexDirection: 'row',
-    justifyContent: 'center',
-    marginTop: 20,
-    marginBottom: 20,
+    justifyContent: 'space-between',
+    width: '100%',
+    marginBottom: 24,
   },
-  actionButton: {
-    backgroundColor: '#2196F3',
+  button: {
+    borderRadius: 8,
     paddingVertical: 12,
     paddingHorizontal: 24,
-    borderRadius: 8,
-    margin: 10,
+    justifyContent: 'center',
+    alignItems: 'center',
+    minWidth: 140,
   },
   resetButton: {
-    backgroundColor: '#FF9800',
+    backgroundColor: '#007bff',
+    marginRight: 8,
   },
-  actionButtonText: {
+  reportButton: {
+    backgroundColor: '#6c757d',
+    marginLeft: 8,
+  },
+  reportedButton: {
+    backgroundColor: '#28a745',
+    marginLeft: 8,
+  },
+  disabledButton: {
+    opacity: 0.7,
+  },
+  buttonText: {
     color: 'white',
     fontSize: 16,
-    fontWeight: 'bold',
+    fontWeight: '500',
   },
-  versionText: {
-    fontSize: 12,
-    color: '#78909C',
-    marginTop: 30,
-  },
-  errorCode: {
-    fontSize: 10,
-    color: '#90A4AE',
-    marginTop: 5,
+  thankYouText: {
+    fontSize: 14,
+    color: '#28a745',
+    textAlign: 'center',
   },
 });
 
