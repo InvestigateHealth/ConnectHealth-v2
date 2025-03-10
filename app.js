@@ -5,7 +5,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { NavigationContainer } from '@react-navigation/native';
 import { createStackNavigator } from '@react-navigation/stack';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
-import { ActivityIndicator, StatusBar, View, Text, Platform, AppState } from 'react-native';
+import { ActivityIndicator, StatusBar, View, Text, AppState } from 'react-native';
 import auth from '@react-native-firebase/auth';
 import firestore from '@react-native-firebase/firestore';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -26,11 +26,13 @@ import { UserProvider, useUser } from './src/contexts/UserContext';
 import { ThemeProvider, useTheme } from './src/theme/ThemeContext';
 import { NetworkProvider, useNetwork } from './src/contexts/NetworkContext';
 import { AccessibilityProvider } from './src/contexts/AccessibilityContext';
+import { BlockedUsersProvider } from './src/contexts/BlockedUsersContext';
 import { ErrorBoundary } from './src/components/ErrorBoundary';
 
 // Import utilities
 import { initializeDeepLinking, cleanupDeepLinking } from './src/utils/deepLinking';
 import { AnalyticsService } from './src/services/AnalyticsService';
+import { formatDistanceToNow } from 'date-fns';
 
 // Ignore specific warnings
 LogBox.ignoreLogs([
@@ -81,9 +83,11 @@ const App = () => {
             <ThemeProvider>
               <AccessibilityProvider>
                 <UserProvider>
-                  <NavigationContainer ref={navigationRef}>
-                    <AppContent />
-                  </NavigationContainer>
+                  <BlockedUsersProvider>
+                    <NavigationContainer ref={navigationRef}>
+                      <AppContent />
+                    </NavigationContainer>
+                  </BlockedUsersProvider>
                 </UserProvider>
               </AccessibilityProvider>
             </ThemeProvider>
@@ -102,10 +106,22 @@ const AppContent = () => {
   const { isConnected, isInternetReachable, setOfflineMode } = useNetwork();
   const [offlineMode, setLocalOfflineMode] = useState(false);
   const [appVersion, setAppVersion] = useState('');
+  const [lastSyncTime, setLastSyncTime] = useState(null);
   
   // Get app version for display
   useEffect(() => {
-    setAppVersion(`v${DeviceInfo.getVersion()} (${DeviceInfo.getBuildNumber()})`);
+    async function getAppInfo() {
+      try {
+        const version = await DeviceInfo.getVersion();
+        const buildNumber = await DeviceInfo.getBuildNumber();
+        setAppVersion(`v${version} (${buildNumber})`);
+      } catch (error) {
+        console.error('Error getting app version:', error);
+        setAppVersion('Unknown version');
+      }
+    }
+    
+    getAppInfo();
   }, []);
   
   // Handle network status 
@@ -135,13 +151,28 @@ const AppContent = () => {
         setUserData(userData);
         
         // Update local cache
+        const timestamp = Date.now();
         await AsyncStorage.setItem(`user_${userId}`, JSON.stringify({
           ...userData,
-          _cachedAt: Date.now()
+          _cachedAt: timestamp
         }));
+        
+        setLastSyncTime(timestamp);
+        
+        // Log successful sync
+        AnalyticsService.logEvent('user_data_synced', {
+          success: true,
+          timestamp: timestamp
+        });
       }
     } catch (error) {
       console.error('Error refreshing user data:', error);
+      
+      // Log sync error
+      AnalyticsService.logEvent('user_data_sync_error', {
+        error: error.message,
+        timestamp: Date.now()
+      });
     }
   };
 
@@ -163,7 +194,9 @@ const AppContent = () => {
       try {
         const cachedUserData = await AsyncStorage.getItem(`user_${authUser.uid}`);
         if (cachedUserData) {
-          setUserData(JSON.parse(cachedUserData));
+          const parsedData = JSON.parse(cachedUserData);
+          setUserData(parsedData);
+          setLastSyncTime(parsedData._cachedAt);
         }
       } catch (cacheError) {
         console.error('Error reading cached user data:', cacheError);
@@ -178,16 +211,54 @@ const AppContent = () => {
             const freshUserData = userDoc.data();
             setUserData(freshUserData);
             
+            const timestamp = Date.now();
             // Update cache
             await AsyncStorage.setItem(`user_${authUser.uid}`, JSON.stringify({
               ...freshUserData,
-              _cachedAt: Date.now()
+              _cachedAt: timestamp
             }));
+            
+            setLastSyncTime(timestamp);
           } else {
             // User document doesn't exist but user is authenticated
             // This might happen if account creation failed midway
             console.warn('User authenticated but no Firestore document exists');
-            setLocalOfflineMode(true);
+            
+            // Create a basic user document to prevent future issues
+            try {
+              const userInfo = {
+                uid: authUser.uid,
+                email: authUser.email || '',
+                displayName: authUser.displayName || '',
+                photoURL: authUser.photoURL || '',
+                createdAt: firestore.FieldValue.serverTimestamp(),
+                lastLogin: firestore.FieldValue.serverTimestamp(),
+                // Default settings
+                settings: {
+                  notifications: true,
+                  darkMode: false,
+                  privacyLevel: 'standard',
+                },
+                isProfileComplete: false,
+              };
+              
+              await firestore().collection('users').doc(authUser.uid).set(userInfo);
+              setUserData(userInfo);
+              
+              const timestamp = Date.now();
+              await AsyncStorage.setItem(`user_${authUser.uid}`, JSON.stringify({
+                ...userInfo,
+                _cachedAt: timestamp
+              }));
+              
+              setLastSyncTime(timestamp);
+              
+              // Navigate to profile completion if needed
+              // This will be handled by MainTabNavigator
+            } catch (createError) {
+              console.error('Error creating user document:', createError);
+              setLocalOfflineMode(true);
+            }
           }
         } catch (error) {
           console.error('Error fetching user data:', error);
@@ -199,6 +270,7 @@ const AppContent = () => {
       }
     } else {
       setUserData(null);
+      setLastSyncTime(null);
       setLocalOfflineMode(false);
       
       // Reset analytics user
@@ -270,6 +342,17 @@ const AppContent = () => {
     return null;
   };
 
+  // Format last sync time display
+  const getLastSyncDisplay = () => {
+    if (!lastSyncTime) return '';
+    
+    try {
+      return `Last synced ${formatDistanceToNow(lastSyncTime, { addSuffix: true })}`;
+    } catch (error) {
+      return '';
+    }
+  };
+
   return (
     <>
       <StatusBar 
@@ -299,9 +382,21 @@ const AppContent = () => {
         position: 'absolute',
         bottom: 0,
         right: 0,
-        padding: 2,
-        backgroundColor: 'transparent'
+        padding: 3,
+        backgroundColor: 'transparent',
+        flexDirection: 'column',
+        alignItems: 'flex-end'
       }}>
+        {lastSyncTime && (
+          <Text style={{ 
+            fontSize: 7,
+            color: theme?.colors?.text?.hint || '#999999',
+            opacity: 0.7,
+            marginBottom: 1
+          }}>
+            {getLastSyncDisplay()}
+          </Text>
+        )}
         <Text style={{ 
           fontSize: 8,
           color: theme?.colors?.text?.hint || '#999999',
