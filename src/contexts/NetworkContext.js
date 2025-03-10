@@ -1,9 +1,10 @@
 // src/contexts/NetworkContext.js
-// Context for network connectivity state management
+// Context for network connectivity state management - Production ready
 
-import React, { createContext, useState, useEffect, useContext } from 'react';
+import React, { createContext, useState, useEffect, useContext, useCallback } from 'react';
 import NetInfo from '@react-native-community/netinfo';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { AnalyticsService } from '../services/AnalyticsService';
 
 // Create context
 const NetworkContext = createContext({
@@ -15,7 +16,8 @@ const NetworkContext = createContext({
   setPendingOperations: () => {},
   appIsOnline: true,  // Combined state (user preference + actual connection)
   setUserGoesOffline: () => {},
-  userPreferredOffline: false
+  userPreferredOffline: false,
+  setOfflineMode: () => {}
 });
 
 // Custom hook to use the context
@@ -33,7 +35,7 @@ export const NetworkProvider = ({ children }) => {
   const [userPreferredOffline, setUserPreferredOffline] = useState(false);
   
   // Combined online state
-  const appIsOnline = isConnected && !userPreferredOffline;
+  const appIsOnline = isConnected && isInternetReachable && !userPreferredOffline;
 
   // Load user offline preference from storage
   useEffect(() => {
@@ -49,42 +51,78 @@ export const NetworkProvider = ({ children }) => {
     }
 
     loadOfflinePreference();
+    
+    // Initial network state check
+    NetInfo.fetch().then(state => {
+      setIsConnected(state.isConnected);
+      setIsInternetReachable(state.isInternetReachable);
+      setConnectionType(state.type);
+      
+      // Log network state on init
+      AnalyticsService.logEvent('network_state_changed', {
+        isConnected: state.isConnected,
+        isInternetReachable: state.isInternetReachable,
+        connectionType: state.type
+      });
+    });
   }, []);
 
   // Function to allow user to toggle offline mode
-  const setUserGoesOffline = async (goOffline) => {
+  const setUserGoesOffline = useCallback(async (goOffline) => {
     setUserPreferredOffline(goOffline);
     try {
       await AsyncStorage.setItem('userPreferredOffline', goOffline.toString());
+      
+      // Log user preference
+      AnalyticsService.logEvent('user_offline_preference_changed', {
+        preferOffline: goOffline
+      });
     } catch (error) {
       console.error('Error saving offline preference:', error);
     }
-  };
+  }, []);
+  
+  // External function to set offline mode (used by App.js)
+  const setOfflineMode = useCallback((isOffline) => {
+    // Only update if the value is changing to prevent unnecessary rerenders
+    if (isOffline !== userPreferredOffline) {
+      setUserGoesOffline(isOffline);
+    }
+  }, [userPreferredOffline, setUserGoesOffline]);
 
   useEffect(() => {
     // Function to handle connectivity changes
     const handleConnectivityChange = (state) => {
+      const wasConnected = isConnected && isInternetReachable;
+      const isNowConnected = state.isConnected && state.isInternetReachable;
+      
       setIsConnected(state.isConnected);
       setIsInternetReachable(state.isInternetReachable);
       setConnectionType(state.type);
       
       // Update lastOnline timestamp when connection is established
-      if (state.isConnected && !isConnected) {
+      if (isNowConnected) {
         setLastOnline(Date.now());
+      }
+      
+      // Log network state changes
+      if (wasConnected !== isNowConnected) {
+        AnalyticsService.logEvent('network_state_changed', {
+          isConnected: state.isConnected,
+          isInternetReachable: state.isInternetReachable,
+          connectionType: state.type
+        });
       }
     };
 
     // Subscribe to network info events
     const unsubscribe = NetInfo.addEventListener(handleConnectivityChange);
 
-    // Get initial state
-    NetInfo.fetch().then(handleConnectivityChange);
-
     // Cleanup
     return () => {
       unsubscribe();
     };
-  }, [isConnected]);
+  }, [isConnected, isInternetReachable]);
 
   // Save network state to AsyncStorage for offline detection across app restarts
   useEffect(() => {
@@ -92,6 +130,7 @@ export const NetworkProvider = ({ children }) => {
       try {
         await AsyncStorage.setItem('lastNetworkState', JSON.stringify({
           isConnected,
+          isInternetReachable,
           lastOnline,
           timestamp: Date.now()
         }));
@@ -101,7 +140,7 @@ export const NetworkProvider = ({ children }) => {
     }
 
     saveNetworkState();
-  }, [isConnected, lastOnline]);
+  }, [isConnected, isInternetReachable, lastOnline]);
 
   // Context value
   const contextValue = {
@@ -113,7 +152,8 @@ export const NetworkProvider = ({ children }) => {
     setPendingOperations,
     appIsOnline,
     setUserGoesOffline,
-    userPreferredOffline
+    userPreferredOffline,
+    setOfflineMode
   };
 
   return (

@@ -1,4 +1,6 @@
 // src/contexts/BlockedUsersContext.js
+// Context provider for managing blocked users
+
 import React, { createContext, useState, useEffect, useContext } from 'react';
 import firestore from '@react-native-firebase/firestore';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -16,6 +18,7 @@ export const BlockedUsersProvider = ({ children }) => {
   const [blockedUsers, setBlockedUsers] = useState([]);
   const [blockedByUsers, setBlockedByUsers] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [unsubscribeListener, setUnsubscribeListener] = useState(null);
   
   // Load and sync blocked users
   useEffect(() => {
@@ -77,6 +80,12 @@ export const BlockedUsersProvider = ({ children }) => {
     
     loadBlockedUsers();
     
+    // Clean up existing listener if it exists
+    if (unsubscribeListener) {
+      unsubscribeListener();
+      setUnsubscribeListener(null);
+    }
+    
     // Set up real-time listener for changes to the blocked users
     if (user && isConnected) {
       const unsubscribe = firestore()
@@ -92,9 +101,22 @@ export const BlockedUsersProvider = ({ children }) => {
           console.error('Error in blocked users real-time listener:', error);
         });
         
-      return () => unsubscribe();
+      setUnsubscribeListener(() => unsubscribe);
+      
+      return () => {
+        unsubscribe();
+      };
     }
   }, [user, isConnected]);
+  
+  // Clean up listener on unmount
+  useEffect(() => {
+    return () => {
+      if (unsubscribeListener) {
+        unsubscribeListener();
+      }
+    };
+  }, [unsubscribeListener]);
   
   // Function to block a user
   const blockUser = async (userIdToBlock) => {
@@ -208,3 +230,5 @@ export const BlockedUsersProvider = ({ children }) => {
     </BlockedUsersContext.Provider>
   );
 };
+
+export default BlockedUsersContext;
