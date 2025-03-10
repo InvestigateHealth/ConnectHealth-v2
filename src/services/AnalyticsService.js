@@ -1,165 +1,198 @@
 // src/services/AnalyticsService.js
-// Service for tracking analytics events in the app
-
-import { Platform } from 'react-native';
-import { Amplitude } from 'react-native-analytics-amplitude';
+import firestore from '@react-native-firebase/firestore';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import NetInfo from '@react-native-community/netinfo';
 import DeviceInfo from 'react-native-device-info';
 import Config from 'react-native-config';
-import { getUniqueId } from 'react-native-device-info';
-import firestore from '@react-native-firebase/firestore';
-import auth from '@react-native-firebase/auth';
-
-// Initialize Amplitude with API keys from config
-const AMPLITUDE_API_KEY = Config.AMPLITUDE_API_KEY || '';
-
-// Flag to enable/disable analytics in development
-const ANALYTICS_ENABLED = !__DEV__ || Config.FORCE_ANALYTICS === 'true';
-
-// User property constants
-const USER_PROPERTIES = {
-  DEVICE_TYPE: 'deviceType',
-  APP_VERSION: 'appVersion',
-  OS_VERSION: 'osVersion',
-  PLATFORM: 'platform',
-  LAST_UPDATED: 'lastUpdated',
-};
-
-// Initialize flag
-let hasInitialized = false;
-
-// Initialize analytics
-const initializeAnalytics = async () => {
-  if (hasInitialized || !ANALYTICS_ENABLED) return;
-  
-  try {
-    await Amplitude.initializeInstance({
-      instanceName: 'healthconnect',
-      apiKey: AMPLITUDE_API_KEY,
-    });
-    
-    hasInitialized = true;
-    
-    // Set device info as user properties
-    const deviceType = DeviceInfo.getDeviceType();
-    const appVersion = DeviceInfo.getVersion();
-    const buildNumber = DeviceInfo.getBuildNumber();
-    const osVersion = DeviceInfo.getSystemVersion();
-    
-    await Amplitude.setUserProperties({
-      [USER_PROPERTIES.DEVICE_TYPE]: deviceType,
-      [USER_PROPERTIES.APP_VERSION]: `${appVersion} (${buildNumber})`,
-      [USER_PROPERTIES.OS_VERSION]: osVersion,
-      [USER_PROPERTIES.PLATFORM]: Platform.OS,
-      [USER_PROPERTIES.LAST_UPDATED]: new Date().toISOString(),
-    });
-    
-    console.log('Analytics initialized successfully');
-  } catch (error) {
-    console.error('Failed to initialize analytics:', error);
-  }
-};
-
-// Call initialize when the module is imported
-initializeAnalytics();
 
 /**
- * Identify user for analytics
- * @param {string} userId - The user ID
- * @param {Object} userProperties - Additional user properties
+ * Analytics Service to track user events and interactions
  */
-const identifyUser = async (userId, userProperties = {}) => {
-  if (!ANALYTICS_ENABLED || !hasInitialized) return;
-  
-  try {
-    // Set user ID in Amplitude
-    await Amplitude.setUserId(userId);
+class AnalyticsService {
+  constructor() {
+    this.userId = null;
+    this.sessionId = `session_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+    this.cachedEvents = [];
+    this.isInitialized = false;
+    this.deviceInfo = {};
     
-    // Set user properties
-    if (Object.keys(userProperties).length > 0) {
-      await Amplitude.setUserProperties(userProperties);
+    // Initialize the service
+    this.initialize();
+  }
+  
+  /**
+   * Initialize analytics service with device information
+   */
+  async initialize() {
+    try {
+      this.deviceInfo = {
+        appVersion: await DeviceInfo.getVersion(),
+        buildNumber: await DeviceInfo.getBuildNumber(),
+        deviceModel: await DeviceInfo.getModel(),
+        systemName: await DeviceInfo.getSystemName(),
+        systemVersion: await DeviceInfo.getSystemVersion(),
+        isTablet: await DeviceInfo.isTablet(),
+      };
+      
+      // Try to load any cached events that haven't been sent yet
+      const cachedEvents = await AsyncStorage.getItem('cached_analytics_events');
+      if (cachedEvents) {
+        this.cachedEvents = JSON.parse(cachedEvents);
+        this.trySendingCachedEvents();
+      }
+      
+      this.isInitialized = true;
+    } catch (error) {
+      console.error('Error initializing analytics service:', error);
+    }
+  }
+  
+  /**
+   * Identify the current user
+   * @param {string} userId - User identifier
+   */
+  identifyUser(userId) {
+    this.userId = userId;
+    
+    // Try to send any cached events now that we have a user ID
+    if (this.cachedEvents.length > 0) {
+      this.trySendingCachedEvents();
+    }
+  }
+  
+  /**
+   * Reset user identification (e.g., on logout)
+   */
+  resetUser() {
+    this.userId = null;
+    this.sessionId = `session_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+  }
+  
+  /**
+   * Log an event with the analytics service
+   * @param {string} eventName - Name of the event to log
+   * @param {Object} params - Additional event parameters
+   */
+  async logEvent(eventName, params = {}) {
+    if (!this.isInitialized) {
+      await this.initialize();
     }
     
-    // Update analytics settings in Firestore
-    const user = auth().currentUser;
-    if (user) {
-      await firestore().collection('users').doc(user.uid).update({
-        analytics: {
-          lastActive: firestore.FieldValue.serverTimestamp(),
-          deviceId: await getUniqueId(),
-          platform: Platform.OS,
-          version: DeviceInfo.getVersion()
-        }
+    const eventData = {
+      eventName,
+      timestamp: new Date().toISOString(),
+      userId: this.userId,
+      sessionId: this.sessionId,
+      deviceInfo: this.deviceInfo,
+      params,
+    };
+    
+    // Check if we can send this event immediately
+    const networkState = await NetInfo.fetch();
+    
+    if (networkState.isConnected && !Config.FORCE_OFFLINE_ANALYTICS) {
+      try {
+        await this.sendEvent(eventData);
+      } catch (error) {
+        console.error('Error sending analytics event:', error);
+        // Cache the event for later if sending fails
+        this.cacheEvent(eventData);
+      }
+    } else {
+      // Cache the event for later sending
+      this.cacheEvent(eventData);
+    }
+  }
+  
+  /**
+   * Cache an event for later sending
+   * @param {Object} eventData - Event data to cache
+   */
+  async cacheEvent(eventData) {
+    try {
+      this.cachedEvents.push(eventData);
+      
+      // Limit the cache size to prevent it from growing too large
+      if (this.cachedEvents.length > 500) {
+        this.cachedEvents = this.cachedEvents.slice(-500);
+      }
+      
+      await AsyncStorage.setItem('cached_analytics_events', JSON.stringify(this.cachedEvents));
+    } catch (error) {
+      console.error('Error caching analytics event:', error);
+    }
+  }
+  
+  /**
+   * Send an event to the analytics backend
+   * @param {Object} eventData - Event data to send
+   */
+  async sendEvent(eventData) {
+    if (!eventData) return;
+    
+    try {
+      await firestore().collection('analytics').add({
+        ...eventData,
+        serverTimestamp: firestore.FieldValue.serverTimestamp(),
       });
+    } catch (error) {
+      console.error('Error sending analytics event to Firestore:', error);
+      throw error;
     }
-  } catch (error) {
-    console.error('Error identifying user for analytics:', error);
   }
-};
-
-/**
- * Reset user identification (e.g., on logout)
- */
-const resetUser = async () => {
-  if (!ANALYTICS_ENABLED || !hasInitialized) return;
   
-  try {
-    await Amplitude.clearUserProperties();
-    await Amplitude.setUserId(null);
-  } catch (error) {
-    console.error('Error resetting analytics user:', error);
+  /**
+   * Try to send any cached events
+   */
+  async trySendingCachedEvents() {
+    if (this.cachedEvents.length === 0) return;
+    
+    const networkState = await NetInfo.fetch();
+    
+    if (!networkState.isConnected) return;
+    
+    const eventsToSend = [...this.cachedEvents];
+    this.cachedEvents = [];
+    
+    // Update the cache immediately
+    await AsyncStorage.setItem('cached_analytics_events', JSON.stringify(this.cachedEvents));
+    
+    // Send events in batches to avoid overwhelming the network
+    const batchSize = 20;
+    for (let i = 0; i < eventsToSend.length; i += batchSize) {
+      const batch = eventsToSend.slice(i, i + batchSize);
+      
+      try {
+        // Use a batched write for efficiency
+        const batch = firestore().batch();
+        
+        batch.forEach(eventData => {
+          // Update the user ID if it was missing before
+          if (!eventData.userId && this.userId) {
+            eventData.userId = this.userId;
+          }
+          
+          const docRef = firestore().collection('analytics').doc();
+          batch.set(docRef, {
+            ...eventData,
+            serverTimestamp: firestore.FieldValue.serverTimestamp(),
+          });
+        });
+        
+        await batch.commit();
+      } catch (error) {
+        console.error('Error sending cached analytics events:', error);
+        
+        // Re-cache the events that failed to send
+        this.cachedEvents = [...this.cachedEvents, ...batch];
+        await AsyncStorage.setItem('cached_analytics_events', JSON.stringify(this.cachedEvents));
+        
+        // Stop trying to send more events for now
+        break;
+      }
+    }
   }
-};
+}
 
-/**
- * Log an event to analytics
- * @param {string} eventName - Name of the event
- * @param {Object} eventProperties - Properties for the event
- */
-const logEvent = async (eventName, eventProperties = {}) => {
-  if (!ANALYTICS_ENABLED || !hasInitialized) return;
-  
-  try {
-    await Amplitude.logEvent({
-      eventType: eventName,
-      eventProperties,
-    });
-  } catch (error) {
-    console.error(`Error logging event ${eventName}:`, error);
-  }
-};
-
-/**
- * Log a screen view event
- * @param {string} screenName - Name of the screen
- * @param {Object} properties - Additional properties
- */
-const logScreenView = async (screenName, properties = {}) => {
-  await logEvent('screen_view', {
-    screen_name: screenName,
-    ...properties,
-  });
-};
-
-/**
- * Log an error event
- * @param {string} errorMessage - Error message
- * @param {string} errorSource - Source of the error
- * @param {Object} additionalInfo - Additional error info
- */
-const logError = async (errorMessage, errorSource, additionalInfo = {}) => {
-  await logEvent('error', {
-    error_message: errorMessage,
-    error_source: errorSource,
-    ...additionalInfo,
-  });
-};
-
-export const AnalyticsService = {
-  identifyUser,
-  resetUser,
-  logEvent,
-  logScreenView,
-  logError,
-};
-
-export default AnalyticsService;
+// Create a singleton instance
+export const AnalyticsService = new AnalyticsService();
