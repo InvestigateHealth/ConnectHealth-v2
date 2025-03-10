@@ -1,129 +1,99 @@
 // src/utils/dateUtils.js
-// Utilities for date formatting and handling
+// Date utility functions for the app
 
-import { format, formatDistanceToNow, isValid, parseISO } from 'date-fns';
+import { format, formatDistanceToNow, isToday, isYesterday, isThisWeek, isThisMonth, isThisYear, parseISO } from 'date-fns';
 
 /**
- * Format a timestamp for display in the app.
+ * Format a timestamp into a relative time string (e.g., "2 hours ago")
  * 
- * @param {Date|Timestamp|number|string} timestamp - Firebase timestamp, Date object, timestamp in ms, or ISO string
- * @param {boolean} useRelative - Whether to use relative time for recent dates
+ * @param {Date|string|number} date - The date to format
+ * @param {Object} options - Format options
+ * @returns {string} Formatted relative time
+ */
+export const timeAgo = (date, options = {}) => {
+  if (!date) return '';
+  
+  try {
+    // Convert to Date object if it's not already
+    const dateObj = typeof date === 'string' ? parseISO(date) : date instanceof Date ? date : new Date(date);
+    
+    return formatDistanceToNow(dateObj, {
+      addSuffix: true,
+      ...options,
+    });
+  } catch (error) {
+    console.error('Error formatting relative time:', error);
+    return '';
+  }
+};
+
+/**
+ * Format a timestamp into a smart date string based on how recent it is
+ * 
+ * @param {Date|string|number} date - The date to format
  * @returns {string} Formatted date string
  */
-export const formatTimestamp = (timestamp, useRelative = true) => {
-  if (!timestamp) return '';
+export const smartDateFormat = (date) => {
+  if (!date) return '';
   
   try {
-    // Parse the timestamp into a Date object based on its type
-    let date;
+    // Convert to Date object if it's not already
+    const dateObj = typeof date === 'string' ? parseISO(date) : date instanceof Date ? date : new Date(date);
     
-    if (typeof timestamp === 'string') {
-      // Handle ISO string
-      date = parseISO(timestamp);
-    } else if (typeof timestamp === 'number') {
-      // Handle timestamp in milliseconds
-      date = new Date(timestamp);
-    } else if (timestamp.toDate) {
-      // Handle Firebase Timestamp objects
-      date = timestamp.toDate();
-    } else if (timestamp instanceof Date) {
-      // Handle Date object
-      date = timestamp;
+    if (isToday(dateObj)) {
+      return format(dateObj, "'Today at' h:mm a");
+    } else if (isYesterday(dateObj)) {
+      return format(dateObj, "'Yesterday at' h:mm a");
+    } else if (isThisWeek(dateObj)) {
+      return format(dateObj, "EEEE 'at' h:mm a");
+    } else if (isThisMonth(dateObj)) {
+      return format(dateObj, "MMMM d 'at' h:mm a");
+    } else if (isThisYear(dateObj)) {
+      return format(dateObj, "MMMM d");
     } else {
-      return '';
+      return format(dateObj, "MMMM d, yyyy");
     }
-    
-    if (!isValid(date)) {
-      return '';
-    }
-    
-    // For recent dates, use relative time if requested
-    if (useRelative && new Date() - date < 24 * 60 * 60 * 1000) {
-      return formatDistanceToNow(date, { addSuffix: true });
-    }
-    
-    // Otherwise use standard date format
-    return format(date, 'MMM d, yyyy');
   } catch (error) {
-    console.error('Error formatting timestamp:', error);
+    console.error('Error formatting smart date:', error);
     return '';
   }
 };
 
 /**
- * Format full date time for detailed views
+ * Format a date for a calendar or schedule display
  * 
- * @param {Date|Timestamp|number|string} timestamp - Firebase timestamp, Date object, timestamp in ms, or ISO string
- * @returns {string} Formatted date and time
+ * @param {Date|string|number} date - The date to format
+ * @returns {string} Formatted date string
  */
-export const formatDateTime = (timestamp) => {
-  if (!timestamp) return '';
+export const calendarDateFormat = (date) => {
+  if (!date) return '';
   
   try {
-    // Parse the timestamp into a Date object based on its type
-    let date;
+    // Convert to Date object if it's not already
+    const dateObj = typeof date === 'string' ? parseISO(date) : date instanceof Date ? date : new Date(date);
     
-    if (typeof timestamp === 'string') {
-      // Handle ISO string
-      date = parseISO(timestamp);
-    } else if (typeof timestamp === 'number') {
-      // Handle timestamp in milliseconds
-      date = new Date(timestamp);
-    } else if (timestamp.toDate) {
-      // Handle Firebase Timestamp objects
-      date = timestamp.toDate();
-    } else if (timestamp instanceof Date) {
-      // Handle Date object
-      date = timestamp;
-    } else {
-      return '';
-    }
-    
-    if (!isValid(date)) {
-      return '';
-    }
-    
-    return format(date, 'MMM d, yyyy h:mm a');
+    return format(dateObj, 'EEEE, MMMM d, yyyy');
   } catch (error) {
-    console.error('Error formatting date time:', error);
+    console.error('Error formatting calendar date:', error);
     return '';
   }
 };
 
 /**
- * Format time only
+ * Format a time for display
  * 
- * @param {Date|Timestamp|number|string} timestamp - Firebase timestamp, Date object, timestamp in ms, or ISO string
- * @returns {string} Formatted time
+ * @param {Date|string|number} date - The date to extract time from
+ * @param {boolean} includeSeconds - Whether to include seconds
+ * @returns {string} Formatted time string
  */
-export const formatTime = (timestamp) => {
-  if (!timestamp) return '';
+export const timeFormat = (date, includeSeconds = false) => {
+  if (!date) return '';
   
   try {
-    // Parse the timestamp into a Date object based on its type
-    let date;
+    // Convert to Date object if it's not already
+    const dateObj = typeof date === 'string' ? parseISO(date) : date instanceof Date ? date : new Date(date);
     
-    if (typeof timestamp === 'string') {
-      // Handle ISO string
-      date = parseISO(timestamp);
-    } else if (typeof timestamp === 'number') {
-      // Handle timestamp in milliseconds
-      date = new Date(timestamp);
-    } else if (timestamp.toDate) {
-      // Handle Firebase Timestamp objects
-      date = timestamp.toDate();
-    } else if (timestamp instanceof Date) {
-      // Handle Date object
-      date = timestamp;
-    } else {
-      return '';
-    }
-    
-    if (!isValid(date)) {
-      return '';
-    }
-    
-    return format(date, 'h:mm a');
+    return format(dateObj, includeSeconds ? 'h:mm:ss a' : 'h:mm a');
   } catch (error) {
     console.error('Error formatting time:', error);
     return '';
@@ -131,142 +101,44 @@ export const formatTime = (timestamp) => {
 };
 
 /**
- * Format join date for user profiles
+ * Format date range for event display
  * 
- * @param {Date|Timestamp|number|string} timestamp - Firebase timestamp, Date object, timestamp in ms, or ISO string
- * @returns {string} Formatted join date
- */
-export const formatJoinDate = (timestamp) => {
-  if (!timestamp) return 'Recently';
-  
-  try {
-    // Parse the timestamp into a Date object based on its type
-    let date;
-    
-    if (typeof timestamp === 'string') {
-      // Handle ISO string
-      date = parseISO(timestamp);
-    } else if (typeof timestamp === 'number') {
-      // Handle timestamp in milliseconds
-      date = new Date(timestamp);
-    } else if (timestamp.toDate) {
-      // Handle Firebase Timestamp objects
-      date = timestamp.toDate();
-    } else if (timestamp instanceof Date) {
-      // Handle Date object
-      date = timestamp;
-    } else {
-      return 'Recently';
-    }
-    
-    if (!isValid(date)) {
-      return 'Recently';
-    }
-    
-    return format(date, 'MMMM yyyy');
-  } catch (error) {
-    console.error('Error formatting join date:', error);
-    return 'Recently';
-  }
-};
-
-/**
- * Get relative time (e.g., 5 minutes ago, 2 hours ago)
- * 
- * @param {Date|Timestamp|number|string} timestamp - Firebase timestamp, Date object, timestamp in ms, or ISO string
- * @returns {string} Relative time
- */
-export const getRelativeTime = (timestamp) => {
-  if (!timestamp) return '';
-  
-  try {
-    // Parse the timestamp into a Date object based on its type
-    let date;
-    
-    if (typeof timestamp === 'string') {
-      // Handle ISO string
-      date = parseISO(timestamp);
-    } else if (typeof timestamp === 'number') {
-      // Handle timestamp in milliseconds
-      date = new Date(timestamp);
-    } else if (timestamp.toDate) {
-      // Handle Firebase Timestamp objects
-      date = timestamp.toDate();
-    } else if (timestamp instanceof Date) {
-      // Handle Date object
-      date = timestamp;
-    } else {
-      return '';
-    }
-    
-    if (!isValid(date)) {
-      return '';
-    }
-    
-    return formatDistanceToNow(date, { addSuffix: true });
-  } catch (error) {
-    console.error('Error getting relative time:', error);
-    return '';
-  }
-};
-
-/**
- * Format date range (e.g., Jan 1 - Jan 5, 2023)
- * 
- * @param {Date|Timestamp|number|string} startDate - Start date
- * @param {Date|Timestamp|number|string} endDate - End date
+ * @param {Date|string|number} startDate - Start date
+ * @param {Date|string|number} endDate - End date
  * @returns {string} Formatted date range
  */
-export const formatDateRange = (startDate, endDate) => {
+export const dateRangeFormat = (startDate, endDate) => {
   if (!startDate || !endDate) return '';
   
   try {
-    // Parse the dates
-    let start;
-    let end;
+    // Convert to Date objects if they're not already
+    const startDateObj = typeof startDate === 'string' ? parseISO(startDate) : startDate instanceof Date ? startDate : new Date(startDate);
+    const endDateObj = typeof endDate === 'string' ? parseISO(endDate) : endDate instanceof Date ? endDate : new Date(endDate);
     
-    // Handle start date
-    if (typeof startDate === 'string') {
-      start = parseISO(startDate);
-    } else if (typeof startDate === 'number') {
-      start = new Date(startDate);
-    } else if (startDate.toDate) {
-      start = startDate.toDate();
-    } else if (startDate instanceof Date) {
-      start = startDate;
-    } else {
-      return '';
+    // Same day
+    if (
+      startDateObj.getFullYear() === endDateObj.getFullYear() &&
+      startDateObj.getMonth() === endDateObj.getMonth() &&
+      startDateObj.getDate() === endDateObj.getDate()
+    ) {
+      return `${format(startDateObj, 'MMMM d, yyyy')} · ${format(startDateObj, 'h:mm a')} - ${format(endDateObj, 'h:mm a')}`;
     }
     
-    // Handle end date
-    if (typeof endDate === 'string') {
-      end = parseISO(endDate);
-    } else if (typeof endDate === 'number') {
-      end = new Date(endDate);
-    } else if (endDate.toDate) {
-      end = endDate.toDate();
-    } else if (endDate instanceof Date) {
-      end = endDate;
-    } else {
-      return '';
-    }
-    
-    if (!isValid(start) || !isValid(end)) {
-      return '';
+    // Same month
+    if (
+      startDateObj.getFullYear() === endDateObj.getFullYear() &&
+      startDateObj.getMonth() === endDateObj.getMonth()
+    ) {
+      return `${format(startDateObj, 'MMMM d')} - ${format(endDateObj, 'd, yyyy')}`;
     }
     
     // Same year
-    if (start.getFullYear() === end.getFullYear()) {
-      // Same month
-      if (start.getMonth() === end.getMonth()) {
-        return `${format(start, 'MMM d')} - ${format(end, 'd, yyyy')}`;
-      }
-      // Different month
-      return `${format(start, 'MMM d')} - ${format(end, 'MMM d, yyyy')}`;
+    if (startDateObj.getFullYear() === endDateObj.getFullYear()) {
+      return `${format(startDateObj, 'MMMM d')} - ${format(endDateObj, 'MMMM d, yyyy')}`;
     }
     
-    // Different year
-    return `${format(start, 'MMM d, yyyy')} - ${format(end, 'MMM d, yyyy')}`;
+    // Different years
+    return `${format(startDateObj, 'MMMM d, yyyy')} - ${format(endDateObj, 'MMMM d, yyyy')}`;
   } catch (error) {
     console.error('Error formatting date range:', error);
     return '';
@@ -274,100 +146,75 @@ export const formatDateRange = (startDate, endDate) => {
 };
 
 /**
- * Format duration in seconds to readable format (e.g., 1h 30m)
+ * Get the current date at midnight (start of day)
  * 
- * @param {number} seconds - Duration in seconds
- * @returns {string} Formatted duration
+ * @returns {Date} Date object at start of current day
  */
-export const formatDuration = (seconds) => {
-  if (!seconds && seconds !== 0) return '';
-  
-  try {
-    const totalSeconds = Math.floor(seconds);
-    
-    const hours = Math.floor(totalSeconds / 3600);
-    const minutes = Math.floor((totalSeconds % 3600) / 60);
-    const remainingSeconds = totalSeconds % 60;
-    
-    if (hours > 0) {
-      return `${hours}h ${minutes}m`;
-    } else if (minutes > 0) {
-      return `${minutes}m ${remainingSeconds}s`;
-    } else {
-      return `${remainingSeconds}s`;
-    }
-  } catch (error) {
-    console.error('Error formatting duration:', error);
-    return '';
-  }
+export const startOfToday = () => {
+  const date = new Date();
+  date.setHours(0, 0, 0, 0);
+  return date;
 };
 
 /**
- * Check if a date is today
+ * Get the date at the end of the current day (23:59:59.999)
  * 
- * @param {Date|Timestamp|number|string} date - Date to check
- * @returns {boolean} Whether the date is today
+ * @returns {Date} Date object at end of current day
  */
-export const isToday = (date) => {
+export const endOfToday = () => {
+  const date = new Date();
+  date.setHours(23, 59, 59, 999);
+  return date;
+};
+
+/**
+ * Check if a date is in the past
+ * 
+ * @param {Date|string|number} date - The date to check
+ * @returns {boolean} Whether the date is in the past
+ */
+export const isPast = (date) => {
   if (!date) return false;
   
   try {
-    // Parse the date
-    let dateObj;
+    // Convert to Date object if it's not already
+    const dateObj = typeof date === 'string' ? parseISO(date) : date instanceof Date ? date : new Date(date);
     
-    if (typeof date === 'string') {
-      dateObj = parseISO(date);
-    } else if (typeof date === 'number') {
-      dateObj = new Date(date);
-    } else if (date.toDate) {
-      dateObj = date.toDate();
-    } else if (date instanceof Date) {
-      dateObj = date;
-    } else {
-      return false;
-    }
-    
-    if (!isValid(dateObj)) {
-      return false;
-    }
-    
-    const today = new Date();
-    
-    return (
-      dateObj.getDate() === today.getDate() &&
-      dateObj.getMonth() === today.getMonth() &&
-      dateObj.getFullYear() === today.getFullYear()
-    );
+    return dateObj < new Date();
   } catch (error) {
-    console.error('Error checking if date is today:', error);
+    console.error('Error checking if date is in past:', error);
     return false;
   }
 };
 
 /**
- * Convert Firebase timestamp to Date object safely
+ * Check if a date is in the future
  * 
- * @param {Timestamp|any} timestamp - Firebase timestamp or other value
- * @returns {Date|null} Date object or null if invalid
+ * @param {Date|string|number} date - The date to check
+ * @returns {boolean} Whether the date is in the future
  */
-export const toDate = (timestamp) => {
-  if (!timestamp) return null;
+export const isFuture = (date) => {
+  if (!date) return false;
   
   try {
-    if (timestamp.toDate) {
-      return timestamp.toDate();
-    } else if (timestamp instanceof Date) {
-      return timestamp;
-    } else if (typeof timestamp === 'number') {
-      return new Date(timestamp);
-    } else if (typeof timestamp === 'string') {
-      const date = parseISO(timestamp);
-      return isValid(date) ? date : null;
-    }
+    // Convert to Date object if it's not already
+    const dateObj = typeof date === 'string' ? parseISO(date) : date instanceof Date ? date : new Date(date);
     
-    return null;
+    return dateObj > new Date();
   } catch (error) {
-    console.error('Error converting to date:', error);
-    return null;
+    console.error('Error checking if date is in future:', error);
+    return false;
   }
+};
+
+export default {
+  timeAgo,
+  smartDateFormat,
+  calendarDateFormat,
+  timeFormat,
+  dateRangeFormat,
+  startOfToday,
+  endOfToday,
+  isPast,
+  isFuture,
 };
