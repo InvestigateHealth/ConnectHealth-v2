@@ -19,6 +19,7 @@ export default class SocialMediaUtils {
     // Extract YouTube video IDs
     YOUTUBE_VIDEO: /(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/i,
   };
+  
   // Define supported social media platforms and their URL patterns
   static PLATFORMS = {
     FACEBOOK: {
@@ -214,7 +215,6 @@ export default class SocialMediaUtils {
       throw error;
     }
   }
-  }
   
   /**
    * Detect social media platform from a URL
@@ -240,3 +240,5 @@ export default class SocialMediaUtils {
     }
     
     return null;
+  }
+}
