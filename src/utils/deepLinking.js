@@ -1,155 +1,155 @@
 // src/utils/deepLinking.js
-// Utility to handle deep links and URL schemes in the app
+// Utility for handling deep linking functionality
 
 import { Linking } from 'react-native';
-import { DeepLinking } from 'react-native-deep-linking';
 import { AnalyticsService } from '../services/AnalyticsService';
 
-// URL scheme for the app
-export const APP_URL_SCHEME = 'healthconnect://';
-
-// Web domain for universal links (iOS) and app links (Android)
-export const APP_WEB_DOMAIN = 'healthconnect.example.com';
-
 /**
- * Initialize deep linking handlers
- * @param {Object} navigation - Navigation object
+ * Initialize deep linking
+ * @param {Object} navigationRef - Navigation reference from React Navigation
+ * @returns {Function} Cleanup function
  */
-export const initializeDeepLinking = (navigation) => {
-  // Configure deep linking routes
-  DeepLinking.addScheme(APP_URL_SCHEME);
-  
-  // User profile deep link
-  DeepLinking.addRoute('user/:userId', (params) => {
-    const { userId } = params;
-    if (userId) {
-      navigation.navigate('UserProfile', { userId });
-      AnalyticsService.logEvent('deep_link_open', { 
-        type: 'user_profile', 
-        userId 
-      });
+export const initializeDeepLinking = (navigationRef) => {
+  // Process the initial URL that opened the app
+  const processInitialURL = async () => {
+    try {
+      const url = await Linking.getInitialURL();
+      if (url) {
+        handleDeepLink(url, navigationRef);
+      }
+    } catch (error) {
+      console.error('Error processing initial URL:', error);
     }
-  });
-  
-  // Post deep link
-  DeepLinking.addRoute('post/:postId', (params) => {
-    const { postId } = params;
-    if (postId) {
-      navigation.navigate('PostDetail', { postId });
-      AnalyticsService.logEvent('deep_link_open', { 
-        type: 'post_detail', 
-        postId 
-      });
+  };
+
+  // Handle deep link when the app is already open
+  const handleUrlEvent = ({ url }) => {
+    handleDeepLink(url, navigationRef);
+  };
+
+  // Process initial URL that opened the app
+  processInitialURL();
+
+  // Add event listener for deep links when app is already open
+  const subscription = Linking.addEventListener('url', handleUrlEvent);
+
+  // Return cleanup function
+  return () => {
+    if (subscription && typeof subscription.remove === 'function') {
+      subscription.remove();
+    } else {
+      Linking.removeEventListener('url', handleUrlEvent);
     }
-  });
-  
-  // Event deep link
-  DeepLinking.addRoute('event/:eventId', (params) => {
-    const { eventId } = params;
-    if (eventId) {
-      navigation.navigate('EventDetail', { eventId });
-      AnalyticsService.logEvent('deep_link_open', { 
-        type: 'event_detail', 
-        eventId 
-      });
-    }
-  });
-  
-  // Comments deep link
-  DeepLinking.addRoute('comments/:postId', (params) => {
-    const { postId } = params;
-    if (postId) {
-      navigation.navigate('Comments', { postId });
-      AnalyticsService.logEvent('deep_link_open', { 
-        type: 'comments', 
-        postId 
-      });
-    }
-  });
-  
-  // Handle web URLs using the web domain
-  DeepLinking.addRoute(`https://${APP_WEB_DOMAIN}/user/:userId`, (params) => {
-    const { userId } = params;
-    if (userId) {
-      navigation.navigate('UserProfile', { userId });
-      AnalyticsService.logEvent('deep_link_open', { 
-        type: 'web_user_profile',
-        userId 
-      });
-    }
-  });
-  
-  DeepLinking.addRoute(`https://${APP_WEB_DOMAIN}/post/:postId`, (params) => {
-    const { postId } = params;
-    if (postId) {
-      navigation.navigate('PostDetail', { postId });
-      AnalyticsService.logEvent('deep_link_open', { 
-        type: 'web_post_detail',
-        postId 
-      });
-    }
-  });
-  
-  // Initialize URL handling
-  Linking.addEventListener('url', handleUrl);
-  
-  // Check for initial URL
-  checkInitialUrl();
+  };
 };
 
 /**
- * Handle URL open events
- * @param {Object} event - URL event
- */
-const handleUrl = (event) => {
-  const { url } = event;
-  if (url) {
-    DeepLinking.evaluateUrl(url);
-  }
-};
-
-/**
- * Check for initial URL when app opens
- */
-const checkInitialUrl = async () => {
-  try {
-    const url = await Linking.getInitialURL();
-    if (url) {
-      DeepLinking.evaluateUrl(url);
-    }
-  } catch (error) {
-    console.error('Error getting initial URL:', error);
-  }
-};
-
-/**
- * Create a deep link URL for sharing
- * @param {string} type - Type of link (user, post, event)
- * @param {string} id - ID to include in the link
- * @param {boolean} useWebUrl - Whether to use web URL format
- * @returns {string} Deep link URL
- */
-export const createDeepLink = (type, id, useWebUrl = false) => {
-  if (!type || !id) return '';
-  
-  if (useWebUrl) {
-    return `https://${APP_WEB_DOMAIN}/${type}/${id}`;
-  } else {
-    return `${APP_URL_SCHEME}${type}/${id}`;
-  }
-};
-
-/**
- * Clean up deep linking listeners
+ * Clean up event listeners
  */
 export const cleanupDeepLinking = () => {
   Linking.removeAllListeners('url');
 };
 
-export default {
-  initializeDeepLinking,
-  createDeepLink,
-  cleanupDeepLinking,
-  APP_URL_SCHEME,
-  APP_WEB_DOMAIN,
+/**
+ * Handle deep link URL
+ * @param {string} url - The deep link URL
+ * @param {Object} navigationRef - Navigation reference from React Navigation
+ */
+const handleDeepLink = (url, navigationRef) => {
+  if (!url || !navigationRef) return;
+
+  try {
+    // Log analytics event
+    AnalyticsService.logEvent('deep_link_opened', {
+      url
+    });
+
+    // Parse URL to extract path and parameters
+    const parsedUrl = new URL(url);
+    const path = parsedUrl.pathname.replace(/^\/+|\/+$/g, ''); // Remove leading/trailing slashes
+    const queryParams = {};
+
+    // Parse query parameters
+    parsedUrl.searchParams.forEach((value, key) => {
+      queryParams[key] = value;
+    });
+
+    // Handle different paths
+    switch (path) {
+      case 'post':
+        if (queryParams.id) {
+          navigateToScreen(navigationRef, 'PostDetail', { postId: queryParams.id });
+        }
+        break;
+
+      case 'profile':
+        if (queryParams.id) {
+          navigateToScreen(navigationRef, 'UserProfile', { userId: queryParams.id, title: queryParams.name || 'Profile' });
+        }
+        break;
+
+      case 'event':
+        if (queryParams.id) {
+          navigateToScreen(navigationRef, 'EventDetail', { eventId: queryParams.id });
+        }
+        break;
+
+      case 'chat':
+        if (queryParams.id) {
+          navigateToScreen(navigationRef, 'Chat', { chatId: queryParams.id, userName: queryParams.name || 'Chat' });
+        }
+        break;
+
+      default:
+        console.log('Unhandled deep link path:', path);
+    }
+  } catch (error) {
+    console.error('Error handling deep link:', error);
+  }
+};
+
+/**
+ * Navigate to a screen safely
+ * @param {Object} navigationRef - Navigation reference from React Navigation
+ * @param {string} screenName - Name of the screen to navigate to
+ * @param {Object} params - Parameters to pass to the screen
+ */
+const navigateToScreen = (navigationRef, screenName, params = {}) => {
+  if (navigationRef && navigationRef.isReady()) {
+    // Get current route to determine how to navigate
+    const currentRoute = navigationRef.getCurrentRoute();
+    
+    // If we're on a different tab, we need to navigate to that tab first
+    const tabScreens = {
+      'FeedTab': ['PostDetail', 'UserProfile', 'Comments'],
+      'ExploreTab': ['UserProfile', 'Search'],
+      'EventsTab': ['EventDetail'],
+      'ChatTab': ['Chat', 'UserProfile'],
+      'ProfileTab': ['PostDetail', 'Settings', 'ThemeSettings']
+    };
+
+    let targetTab = null;
+    
+    // Find which tab contains the target screen
+    Object.entries(tabScreens).forEach(([tab, screens]) => {
+      if (screens.includes(screenName)) {
+        targetTab = tab;
+      }
+    });
+
+    // First navigate to the appropriate tab if necessary
+    if (targetTab && (!currentRoute || !currentRoute.name.includes(targetTab))) {
+      navigationRef.navigate(targetTab);
+      
+      // Small delay to ensure tab navigation completes before screen navigation
+      setTimeout(() => {
+        navigationRef.navigate(screenName, params);
+      }, 100);
+    } else {
+      // Direct navigation if already on the correct tab or screen is not tab-specific
+      navigationRef.navigate(screenName, params);
+    }
+  } else {
+    console.warn('Navigation not ready for deep linking');
+  }
 };
