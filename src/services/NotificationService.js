@@ -589,3 +589,8 @@ export const setupNotifications = async () => {
 };
 
 export default PushNotifications;
+
+// Create a singleton instance
+const notificationService = new NotificationService();
+
+export default notificationService;
