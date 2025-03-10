@@ -1,13 +1,17 @@
 // src/hooks/useNotifications.js
-// Custom hook for handling notifications
+// Updated hook for handling notifications using Notifee
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import firestore from '@react-native-firebase/firestore';
-import PushNotification from 'react-native-push-notification';
-import PushNotificationIOS from '@react-native-community/push-notification-ios';
 import { Platform, AppState } from 'react-native';
 import { useUser } from '../contexts/UserContext';
+import notifee from '@notifee/react-native';
+import notificationService from '../services/NotificationService';
 
+/**
+ * Custom hook for handling notifications
+ * @returns {Object} Notification methods and state
+ */
 export const useNotifications = () => {
   const { user } = useUser();
   const [notifications, setNotifications] = useState([]);
@@ -19,86 +23,49 @@ export const useNotifications = () => {
   const notificationsListener = useRef(null);
   const appState = useRef(AppState.currentState);
   
-  // Initialize push notifications
+  // Initialize notification service
   useEffect(() => {
-    // Configure local notifications
-    PushNotification.configure({
-      // (required) Called when a remote is received or opened, or local notification is opened
-      onNotification: function (notification) {
-        // Process the notification
-        if (Platform.OS === 'ios') {
-          notification.finish(PushNotificationIOS.FetchResult.NoData);
-        }
-      },
-      
-      // Should the initial notification be popped automatically
-      popInitialNotification: true,
-      
-      // Request permissions for iOS
-      requestPermissions: Platform.OS === 'ios',
-      
-      // Permissions for Android
-      permissions: {
-        alert: true,
-        badge: true,
-        sound: true,
-      },
-    });
-    
-    // Create notification channel for Android
-    if (Platform.OS === 'android') {
-      PushNotification.createChannel(
-        {
-          channelId: 'health-connect-notifications',
-          channelName: 'HealthConnect Notifications',
-          channelDescription: 'Notifications from the HealthConnect app',
-          importance: 4, // High importance
-          vibrate: true,
-        },
-        (created) => console.log(`Notification channel created: ${created}`)
-      );
-    }
-    
-    // Check permission status
-    const checkPermissions = async () => {
-      try {
-        if (Platform.OS === 'ios') {
-          const permission = await PushNotificationIOS.requestPermissions();
-          setPermissionStatus(permission.alert ? 'granted' : 'denied');
-        } else {
-          // For Android, we manually check since we're not using Firebase messaging directly
-          setPermissionStatus('granted'); // Android defaults to granted unless changed in settings
-        }
-      } catch (error) {
-        console.error('Error checking notification permissions:', error);
-        setPermissionStatus('denied');
+    const initializeNotifications = async () => {
+      if (user) {
+        await notificationService.initialize(user.uid);
+        
+        // Check permission status
+        const settings = await notifee.getNotificationSettings();
+        setPermissionStatus(
+          settings.authorizationStatus > 0 ? 'granted' : 'denied'
+        );
+        
+        // Listen to app state changes to refresh notifications
+        const subscription = AppState.addEventListener('change', nextAppState => {
+          if (appState.current === 'background' && nextAppState === 'active') {
+            refreshNotifications();
+          }
+          appState.current = nextAppState;
+        });
+        
+        return () => {
+          subscription.remove();
+        };
       }
     };
     
-    checkPermissions();
-    
-    // Listen for app state changes to refresh notifications
-    const subscription = AppState.addEventListener('change', nextAppState => {
-      if (appState.current === 'background' && nextAppState === 'active') {
-        refreshNotifications();
-      }
-      appState.current = nextAppState;
-    });
+    initializeNotifications();
     
     return () => {
-      subscription.remove();
-      
-      // Clean up notification listener
       if (notificationsListener.current) {
         notificationsListener.current();
+        notificationsListener.current = null;
       }
     };
-  }, []);
+  }, [user]);
   
   // Fetch notifications when user changes
   useEffect(() => {
     if (user) {
       fetchNotifications();
+      
+      // Set up Firestore notification listener
+      notificationService.setupFirestoreNotificationListener();
     } else {
       setNotifications([]);
       setUnreadCount(0);
@@ -150,10 +117,8 @@ export const useNotifications = () => {
           const unread = notificationData.filter(n => !n.read).length;
           setUnreadCount(unread);
           
-          // Update badge count on iOS
-          if (Platform.OS === 'ios') {
-            PushNotificationIOS.setApplicationIconBadgeNumber(unread);
-          }
+          // Update badge count
+          notificationService.setBadgeCount(unread);
           
           setLoading(false);
           setRefreshing(false);
@@ -185,7 +150,8 @@ export const useNotifications = () => {
         .collection('notifications')
         .doc(notificationId)
         .update({
-          read: true
+          read: true,
+          readAt: firestore.FieldValue.serverTimestamp()
         });
       
       // Update local state
@@ -198,10 +164,8 @@ export const useNotifications = () => {
       // Update unread count
       setUnreadCount(prev => Math.max(0, prev - 1));
       
-      // Update badge count on iOS
-      if (Platform.OS === 'ios') {
-        PushNotificationIOS.setApplicationIconBadgeNumber(Math.max(0, unreadCount - 1));
-      }
+      // Update badge count
+      notificationService.setBadgeCount(Math.max(0, unreadCount - 1));
       
       return true;
     } catch (error) {
@@ -226,8 +190,13 @@ export const useNotifications = () => {
       
       // Create batch to update all at once
       const batch = firestore().batch();
+      const timestamp = firestore.FieldValue.serverTimestamp();
+      
       unreadSnapshot.docs.forEach(doc => {
-        batch.update(doc.ref, { read: true });
+        batch.update(doc.ref, { 
+          read: true,
+          readAt: timestamp 
+        });
       });
       
       await batch.commit();
@@ -240,10 +209,8 @@ export const useNotifications = () => {
       // Update unread count
       setUnreadCount(0);
       
-      // Update badge count on iOS
-      if (Platform.OS === 'ios') {
-        PushNotificationIOS.setApplicationIconBadgeNumber(0);
-      }
+      // Update badge count
+      notificationService.setBadgeCount(0);
       
       return true;
     } catch (error) {
@@ -272,10 +239,8 @@ export const useNotifications = () => {
       if (wasUnread) {
         setUnreadCount(prev => Math.max(0, prev - 1));
         
-        // Update badge count on iOS
-        if (Platform.OS === 'ios') {
-          PushNotificationIOS.setApplicationIconBadgeNumber(Math.max(0, unreadCount - 1));
-        }
+        // Update badge count
+        notificationService.setBadgeCount(Math.max(0, unreadCount - 1));
       }
       
       return true;
@@ -285,6 +250,18 @@ export const useNotifications = () => {
     }
   }, [user, notifications, unreadCount]);
   
+  // Request permission for notifications
+  const requestPermission = useCallback(async () => {
+    try {
+      const granted = await notificationService.requestPermission();
+      setPermissionStatus(granted ? 'granted' : 'denied');
+      return granted;
+    } catch (error) {
+      console.error('Error requesting notification permissions:', error);
+      return false;
+    }
+  }, []);
+  
   // Register device for push notifications
   const registerDevice = useCallback(async () => {
     if (!user) return;
@@ -292,34 +269,70 @@ export const useNotifications = () => {
     try {
       // Request permissions if needed
       if (permissionStatus === 'undetermined') {
-        if (Platform.OS === 'ios') {
-          const permission = await PushNotificationIOS.requestPermissions();
-          if (!permission.alert) {
-            setPermissionStatus('denied');
-            return;
-          }
-          setPermissionStatus('granted');
-        } else {
-          setPermissionStatus('granted');
-        }
+        const granted = await requestPermission();
+        if (!granted) return false;
       }
       
-      if (permissionStatus !== 'granted') return;
-      
-      // Create a device ID that's stable across app reinstalls
-      const deviceId = await PushNotification.getDeviceToken();
-      
-      // Save device ID to user's profile for targeting push notifications
-      await firestore()
-        .collection('users')
-        .doc(user.uid)
-        .update({
-          deviceTokens: firestore.FieldValue.arrayUnion(deviceId)
-        });
+      return true;
     } catch (error) {
       console.error('Error registering device:', error);
+      return false;
     }
-  }, [user, permissionStatus]);
+  }, [user, permissionStatus, requestPermission]);
+  
+  // Display local notification
+  const displayLocalNotification = useCallback(async (title, body, data = {}) => {
+    if (permissionStatus !== 'granted') {
+      const granted = await requestPermission();
+      if (!granted) return false;
+    }
+    
+    try {
+      await notificationService.displayNotification({
+        title,
+        body,
+        data
+      });
+      
+      return true;
+    } catch (error) {
+      console.error('Error displaying local notification:', error);
+      return false;
+    }
+  }, [permissionStatus, requestPermission]);
+  
+  // Schedule a notification
+  const scheduleNotification = useCallback(async (title, body, date, data = {}) => {
+    if (permissionStatus !== 'granted') {
+      const granted = await requestPermission();
+      if (!granted) return null;
+    }
+    
+    try {
+      const notificationId = await notificationService.scheduleNotification(
+        {
+          title,
+          body,
+          data
+        },
+        date
+      );
+      
+      return notificationId;
+    } catch (error) {
+      console.error('Error scheduling notification:', error);
+      return null;
+    }
+  }, [permissionStatus, requestPermission]);
+  
+  // Clean up when component unmounts
+  useEffect(() => {
+    return () => {
+      if (notificationsListener.current) {
+        notificationsListener.current();
+      }
+    };
+  }, []);
   
   return {
     notifications,
@@ -331,7 +344,10 @@ export const useNotifications = () => {
     markAsRead,
     markAllAsRead,
     deleteNotification,
-    registerDevice
+    requestPermission,
+    registerDevice,
+    displayLocalNotification,
+    scheduleNotification
   };
 };
 
