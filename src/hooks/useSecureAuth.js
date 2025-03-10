@@ -1,7 +1,7 @@
 // src/hooks/useSecureAuth.js
 // Custom hook for secure authentication with additional security features
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import auth from '@react-native-firebase/auth';
 import { Platform, Alert } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -19,6 +19,10 @@ export const useSecureAuth = () => {
   const [loading, setLoading] = useState(false);
   const [loginAttempts, setLoginAttempts] = useState(0);
   const [lockoutUntil, setLockoutUntil] = useState(null);
+  
+  // Refs for cleanup functions
+  const tokenRefreshIntervalRef = useRef(null);
+  const sessionTimeoutIntervalRef = useRef(null);
 
   // Constants for security measures
   const MAX_LOGIN_ATTEMPTS = 5;
@@ -55,6 +59,19 @@ export const useSecureAuth = () => {
       console.error('Error loading security settings:', error);
     }
   };
+
+  // Cleanup function to clear all intervals and listeners
+  const cleanupAll = useCallback(() => {
+    if (tokenRefreshIntervalRef.current) {
+      clearInterval(tokenRefreshIntervalRef.current);
+      tokenRefreshIntervalRef.current = null;
+    }
+    
+    if (sessionTimeoutIntervalRef.current) {
+      clearInterval(sessionTimeoutIntervalRef.current);
+      sessionTimeoutIntervalRef.current = null;
+    }
+  }, []);
   
   /**
    * Initialize auth state listener
@@ -77,17 +94,28 @@ export const useSecureAuth = () => {
         
         // Set up token refresh
         setupTokenRefresh();
+      } else {
+        // Clean up intervals when user logs out
+        cleanupAll();
       }
     });
     
-    // Cleanup subscription
-    return subscriber;
+    // Cleanup subscription and intervals on unmount
+    return () => {
+      subscriber();
+      cleanupAll();
+    };
   }, []);
   
   /**
    * Set up session timeout
    */
   const setupSessionTimeout = () => {
+    // Clean up existing interval if it exists
+    if (sessionTimeoutIntervalRef.current) {
+      clearInterval(sessionTimeoutIntervalRef.current);
+    }
+    
     // Get last activity timestamp
     AsyncStorage.getItem('last_activity').then(lastActivity => {
       if (lastActivity) {
@@ -109,14 +137,15 @@ export const useSecureAuth = () => {
     });
     
     // Set interval to check for session timeout
-    const interval = setInterval(() => {
+    sessionTimeoutIntervalRef.current = setInterval(() => {
       AsyncStorage.getItem('last_activity').then(lastActivity => {
         if (lastActivity) {
           const lastActivityTime = parseInt(lastActivity, 10);
           const currentTime = Date.now();
           
           if (currentTime - lastActivityTime > SESSION_TIMEOUT) {
-            clearInterval(interval);
+            clearInterval(sessionTimeoutIntervalRef.current);
+            sessionTimeoutIntervalRef.current = null;
             signOut();
             Alert.alert(
               'Session Expired',
@@ -126,16 +155,26 @@ export const useSecureAuth = () => {
         }
       });
     }, 60000); // Check every minute
-    
-    // Clean up interval on unmount
-    return () => clearInterval(interval);
   };
   
   /**
    * Set up token refresh
    */
   const setupTokenRefresh = () => {
-    const interval = setInterval(async () => {
+    // Clean up existing interval if it exists
+    if (tokenRefreshIntervalRef.current) {
+      clearInterval(tokenRefreshIntervalRef.current);
+    }
+    
+    // Initial token refresh
+    if (auth().currentUser) {
+      auth().currentUser.getIdToken(true).catch(error => {
+        console.error('Error during initial token refresh:', error);
+      });
+    }
+    
+    // Set up interval for regular token refresh
+    tokenRefreshIntervalRef.current = setInterval(async () => {
       if (auth().currentUser) {
         try {
           // Force token refresh
@@ -145,9 +184,6 @@ export const useSecureAuth = () => {
         }
       }
     }, TOKEN_REFRESH_INTERVAL);
-    
-    // Clean up interval on unmount
-    return () => clearInterval(interval);
   };
   
   /**
@@ -261,6 +297,9 @@ export const useSecureAuth = () => {
       
       // Clean up storage
       await AsyncStorage.removeItem('last_activity');
+      
+      // Clean up intervals
+      cleanupAll();
       
       // Sign out with retry capability
       await retry(

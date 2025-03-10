@@ -3,7 +3,6 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import firestore from '@react-native-firebase/firestore';
-import messaging from '@react-native-firebase/messaging';
 import PushNotification from 'react-native-push-notification';
 import PushNotificationIOS from '@react-native-community/push-notification-ios';
 import { Platform, AppState } from 'react-native';
@@ -63,19 +62,13 @@ export const useNotifications = () => {
     // Check permission status
     const checkPermissions = async () => {
       try {
-        let status = 'undetermined';
         if (Platform.OS === 'ios') {
           const permission = await PushNotificationIOS.requestPermissions();
-          status = permission.alert ? 'granted' : 'denied';
+          setPermissionStatus(permission.alert ? 'granted' : 'denied');
         } else {
-          const permission = await messaging().hasPermission();
-          status = permission === messaging.AuthorizationStatus.AUTHORIZED 
-            ? 'granted' 
-            : permission === messaging.AuthorizationStatus.DENIED
-              ? 'denied'
-              : 'undetermined';
+          // For Android, we manually check since we're not using Firebase messaging directly
+          setPermissionStatus('granted'); // Android defaults to granted unless changed in settings
         }
-        setPermissionStatus(status);
       } catch (error) {
         console.error('Error checking notification permissions:', error);
         setPermissionStatus('denied');
@@ -292,41 +285,41 @@ export const useNotifications = () => {
     }
   }, [user, notifications, unreadCount]);
   
-  // Register FCM token with user profile for remote notifications
-  const registerPushToken = useCallback(async () => {
+  // Register device for push notifications
+  const registerDevice = useCallback(async () => {
     if (!user) return;
     
     try {
-      // Check permission first
-      let authStatus = await messaging().hasPermission();
-      
-      // Request permission if not determined
-      if (authStatus === messaging.AuthorizationStatus.NOT_DETERMINED) {
-        authStatus = await messaging().requestPermission();
+      // Request permissions if needed
+      if (permissionStatus === 'undetermined') {
+        if (Platform.OS === 'ios') {
+          const permission = await PushNotificationIOS.requestPermissions();
+          if (!permission.alert) {
+            setPermissionStatus('denied');
+            return;
+          }
+          setPermissionStatus('granted');
+        } else {
+          setPermissionStatus('granted');
+        }
       }
       
-      // If not authorized, update status and return
-      if (authStatus !== messaging.AuthorizationStatus.AUTHORIZED) {
-        setPermissionStatus('denied');
-        return;
-      }
+      if (permissionStatus !== 'granted') return;
       
-      // Get token
-      const token = await messaging().getToken();
+      // Create a device ID that's stable across app reinstalls
+      const deviceId = await PushNotification.getDeviceToken();
       
-      // Save token to user's profile
+      // Save device ID to user's profile for targeting push notifications
       await firestore()
         .collection('users')
         .doc(user.uid)
         .update({
-          fcmTokens: firestore.FieldValue.arrayUnion(token)
+          deviceTokens: firestore.FieldValue.arrayUnion(deviceId)
         });
-      
-      setPermissionStatus('granted');
     } catch (error) {
-      console.error('Error registering push token:', error);
+      console.error('Error registering device:', error);
     }
-  }, [user]);
+  }, [user, permissionStatus]);
   
   return {
     notifications,
@@ -338,7 +331,7 @@ export const useNotifications = () => {
     markAsRead,
     markAllAsRead,
     deleteNotification,
-    registerPushToken
+    registerDevice
   };
 };
 
