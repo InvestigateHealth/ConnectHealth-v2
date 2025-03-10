@@ -1,5 +1,5 @@
-// src/screens/UserProfileScreen.js
-// Improved profile screen for viewing other users
+// src/screens/ProfileScreen.js
+// User's own profile screen with account management
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
@@ -9,131 +9,81 @@ import {
   ScrollView,
   TouchableOpacity,
   FlatList,
-  Share,
   Alert,
   ActivityIndicator,
+  RefreshControl,
+  Share,
   Platform,
-  Modal
+  ActionSheetIOS,
+  Switch
 } from 'react-native';
 import FastImage from 'react-native-fast-image';
 import firestore from '@react-native-firebase/firestore';
 import auth from '@react-native-firebase/auth';
+import storage from '@react-native-firebase/storage';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import Icon from 'react-native-vector-icons/Ionicons';
 import { format } from 'date-fns';
 import { useUser } from '../contexts/UserContext';
 import { useTheme } from '../theme/ThemeContext';
 import { useNetInfo } from '@react-native-community/netinfo';
 import PostThumbnail from '../components/PostThumbnail';
+import { launchImageLibrary } from 'react-native-image-picker';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useNotifications } from '../hooks/useNotifications';
+import * as Haptics from '../utils/haptics';
+import { AnalyticsService } from '../services/AnalyticsService';
 
-const UserProfileScreen = ({ route, navigation }) => {
-  const { userId } = route.params;
-  const { theme } = useTheme();
-  const { user, userData: currentUserData, isUserBlocked, blockUser, unblockUser } = useUser();
+const ProfileScreen = ({ navigation }) => {
+  const { user, userData, updateUserData, signOut } = useUser();
+  const { theme, isDarkMode, toggleTheme } = useTheme();
   const { isConnected } = useNetInfo();
+  const { notificationsEnabled, toggleNotifications } = useNotifications();
+  const insets = useSafeAreaInsets();
   
-  const [userData, setUserData] = useState(null);
+  // States
   const [posts, setPosts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [postsLoading, setPostsLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState('posts'); // 'posts' or 'about'
+  const [refreshing, setRefreshing] = useState(false);
+  const [activeTab, setActiveTab] = useState('posts'); // 'posts' or 'settings'
   const [stats, setStats] = useState({
     followersCount: 0,
     followingCount: 0,
     postsCount: 0
   });
-  const [isFollowing, setIsFollowing] = useState(false);
-  const [followLoading, setFollowLoading] = useState(false);
-  const [blockModalVisible, setBlockModalVisible] = useState(false);
-  const [reportModalVisible, setReportModalVisible] = useState(false);
-  const [blockReason, setBlockReason] = useState('');
-  const [userIsBlocked, setUserIsBlocked] = useState(false);
-  const [error, setError] = useState(null);
+  const [profileImageUploading, setProfileImageUploading] = useState(false);
   
+  // Refs
   const isMounted = useRef(true);
   const postsListener = useRef(null);
-  const connectionListener = useRef(null);
-
-  // Set isMounted flag for preventing state updates after unmount
+  
+  // Cleanup on unmount
   useEffect(() => {
+    // Log screen view for analytics
+    AnalyticsService.logScreenView('Profile');
+    
     return () => {
       isMounted.current = false;
-      if (postsListener.current) {
-        postsListener.current();
-      }
-      if (connectionListener.current) {
-        connectionListener.current();
-      }
-    };
-  }, []);
-
-  // Check if the user is blocked
-  useEffect(() => {
-    if (userId) {
-      setUserIsBlocked(isUserBlocked(userId));
-    }
-  }, [userId, isUserBlocked]);
-
-  // Fetch user data and stats
-  useEffect(() => {
-    fetchUserData();
-    fetchUserStats();
-    checkFollowStatus();
-  }, [userId]);
-
-  // Fetch user posts
-  useEffect(() => {
-    if (activeTab === 'posts' && !userIsBlocked) {
-      fetchUserPosts();
-    } else {
-      setPostsLoading(false);
-    }
-
-    return () => {
+      
       if (postsListener.current) {
         postsListener.current();
         postsListener.current = null;
       }
     };
-  }, [userId, activeTab, userIsBlocked]);
+  }, []);
 
-  // Fetch user data
-  const fetchUserData = async () => {
-    if (!userId) return;
-
-    try {
-      setLoading(true);
-      setError(null);
-      
-      const userDoc = await firestore()
-        .collection('users')
-        .doc(userId)
-        .get();
-      
-      if (userDoc.exists && isMounted.current) {
-        const data = userDoc.data();
-        setUserData({
-          id: userDoc.id,
-          ...data,
-          joinDate: data.joinDate ? data.joinDate.toDate() : new Date()
-        });
-      } else if (isMounted.current) {
-        setError('User not found. This profile may have been deleted.');
-      }
-    } catch (error) {
-      console.error('Error fetching user data:', error);
-      if (isMounted.current) {
-        setError('Failed to load user profile. Please try again.');
-      }
-    } finally {
-      if (isMounted.current) {
-        setLoading(false);
-      }
+  // Load posts when user data is available
+  useEffect(() => {
+    if (user && userData && activeTab === 'posts') {
+      fetchUserPosts();
+      fetchUserStats();
     }
-  };
+  }, [user, userData, activeTab]);
 
-  // Fetch user posts
-  const fetchUserPosts = async () => {
-    if (!userId || userIsBlocked) return;
+  // Function to fetch user posts with realtime updates
+  const fetchUserPosts = useCallback(() => {
+    if (!user) return;
     
     try {
       setPostsLoading(true);
@@ -144,10 +94,10 @@ const UserProfileScreen = ({ route, navigation }) => {
         postsListener.current = null;
       }
       
-      // Create a new realtime listener
+      // Set up realtime listener
       postsListener.current = firestore()
         .collection('posts')
-        .where('userId', '==', userId)
+        .where('userId', '==', user.uid)
         .orderBy('timestamp', 'desc')
         .limit(20)
         .onSnapshot(snapshot => {
@@ -157,14 +107,16 @@ const UserProfileScreen = ({ route, navigation }) => {
               return {
                 id: doc.id,
                 ...data,
-                timestamp: data.timestamp ? data.timestamp.toDate() : new Date(),
+                timestamp: data.timestamp?.toDate() || new Date(),
               };
             });
             
             setPosts(postsData);
             setPostsLoading(false);
-
-            // Update post count
+            setLoading(false);
+            setRefreshing(false);
+            
+            // Update post count in stats
             setStats(prev => ({
               ...prev,
               postsCount: postsData.length
@@ -174,33 +126,37 @@ const UserProfileScreen = ({ route, navigation }) => {
           console.error('Error in posts listener:', error);
           if (isMounted.current) {
             setPostsLoading(false);
+            setLoading(false);
+            setRefreshing(false);
           }
         });
     } catch (error) {
       console.error('Error setting up posts listener:', error);
       if (isMounted.current) {
         setPostsLoading(false);
+        setLoading(false);
+        setRefreshing(false);
       }
     }
-  };
+  }, [user]);
 
-  // Fetch user stats (followers, following)
-  const fetchUserStats = async () => {
-    if (!userId) return;
+  // Function to fetch user stats (followers, following)
+  const fetchUserStats = useCallback(async () => {
+    if (!user) return;
     
     try {
-      // Fetch followers count
+      // Fetch followers
       const followersSnapshot = await firestore()
         .collection('connections')
-        .where('connectedUserId', '==', userId)
+        .where('connectedUserId', '==', user.uid)
         .get();
-
-      // Fetch following count
+      
+      // Fetch following
       const followingSnapshot = await firestore()
         .collection('connections')
-        .where('userId', '==', userId)
+        .where('userId', '==', user.uid)
         .get();
-
+      
       if (isMounted.current) {
         setStats(prev => ({
           ...prev,
@@ -211,279 +167,298 @@ const UserProfileScreen = ({ route, navigation }) => {
     } catch (error) {
       console.error('Error fetching user stats:', error);
     }
-  };
+  }, [user]);
 
-  // Check if the current user is following this user
-  const checkFollowStatus = async () => {
-    if (!userId || !user) return;
-    
-    try {
-      const connectionDoc = await firestore()
-        .collection('connections')
-        .where('userId', '==', user.uid)
-        .where('connectedUserId', '==', userId)
-        .limit(1)
-        .get();
-      
-      if (isMounted.current) {
-        setIsFollowing(!connectionDoc.empty);
-      }
-    } catch (error) {
-      console.error('Error checking follow status:', error);
-    }
-  };
-
-  // Toggle follow status
-  const toggleFollow = async () => {
-    if (!userId || !user || followLoading || !isConnected) {
-      if (!isConnected) {
-        Alert.alert('Offline', 'You cannot follow/unfollow users while offline.');
-      }
+  // Handle refresh
+  const handleRefresh = useCallback(() => {
+    if (!isConnected) {
+      Alert.alert('Offline', 'Cannot refresh while offline');
       return;
     }
     
-    try {
-      setFollowLoading(true);
-      
-      if (isFollowing) {
-        // Unfollow the user
-        const connectionQuery = await firestore()
-          .collection('connections')
-          .where('userId', '==', user.uid)
-          .where('connectedUserId', '==', userId)
-          .limit(1)
-          .get();
-        
-        if (!connectionQuery.empty) {
-          await connectionQuery.docs[0].ref.delete();
-          
-          // Remove notification
-          await firestore()
-            .collection('notifications')
-            .where('type', '==', 'follow')
-            .where('senderId', '==', user.uid)
-            .where('recipientId', '==', userId)
-            .get()
-            .then(snapshot => {
-              snapshot.forEach(doc => {
-                doc.ref.delete();
-              });
-            });
-          
-          if (isMounted.current) {
-            setIsFollowing(false);
-            setStats(prev => ({
-              ...prev,
-              followersCount: Math.max(0, prev.followersCount - 1)
-            }));
+    setRefreshing(true);
+    fetchUserPosts();
+    fetchUserStats();
+  }, [isConnected, fetchUserPosts, fetchUserStats]);
+
+  // Handle profile image selection and upload
+  const handleChangeProfileImage = useCallback(async () => {
+    if (!isConnected) {
+      Alert.alert('Offline', 'Cannot change profile image while offline');
+      return;
+    }
+    
+    if (Platform.OS === 'ios') {
+      ActionSheetIOS.showActionSheetWithOptions(
+        {
+          options: ['Cancel', 'Change Profile Picture', 'Remove Profile Picture'],
+          cancelButtonIndex: 0,
+          destructiveButtonIndex: 2,
+        },
+        (buttonIndex) => {
+          if (buttonIndex === 1) {
+            selectAndUploadImage();
+          } else if (buttonIndex === 2) {
+            confirmRemoveProfileImage();
           }
         }
-      } else {
-        // Follow the user
-        await firestore().collection('connections').add({
-          userId: user.uid,
-          connectedUserId: userId,
-          timestamp: firestore.FieldValue.serverTimestamp()
-        });
+      );
+    } else {
+      // For Android and other platforms
+      Alert.alert(
+        'Profile Picture',
+        'Choose an option',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Change Photo', onPress: selectAndUploadImage },
+          { text: 'Remove Photo', onPress: confirmRemoveProfileImage, style: 'destructive' }
+        ]
+      );
+    }
+  }, [isConnected]);
+
+  // Select and upload a new profile image
+  const selectAndUploadImage = async () => {
+    try {
+      const result = await launchImageLibrary({
+        mediaType: 'photo',
+        quality: 0.8,
+        maxWidth: 800,
+        maxHeight: 800,
+        includeBase64: false,
+      });
+      
+      if (result.didCancel) return;
+      
+      if (result.errorCode) {
+        throw new Error(result.errorMessage || 'Error selecting image');
+      }
+      
+      if (result.assets && result.assets.length > 0) {
+        const image = result.assets[0];
         
-        // Create follow notification
-        await firestore().collection('notifications').add({
-          type: 'follow',
-          senderId: user.uid,
-          senderName: `${currentUserData.firstName} ${currentUserData.lastName}`.trim(),
-          senderProfileImage: currentUserData.profileImageURL || null,
-          recipientId: userId,
-          message: 'started following you',
-          timestamp: firestore.FieldValue.serverTimestamp(),
-          read: false
-        });
-        
-        if (isMounted.current) {
-          setIsFollowing(true);
-          setStats(prev => ({
-            ...prev,
-            followersCount: prev.followersCount + 1
-          }));
+        // Check file size (limit to 5MB)
+        if (image.fileSize > 5 * 1024 * 1024) {
+          Alert.alert('Error', 'Image is too large. Please select an image smaller than 5MB.');
+          return;
         }
+        
+        // Upload the image
+        await uploadProfileImage(image.uri);
       }
     } catch (error) {
-      console.error('Error toggling follow status:', error);
-      Alert.alert('Error', `Failed to ${isFollowing ? 'unfollow' : 'follow'} user. Please try again.`);
-    } finally {
-      if (isMounted.current) {
-        setFollowLoading(false);
-      }
+      console.error('Error selecting/uploading image:', error);
+      Alert.alert('Error', 'Failed to change profile picture. Please try again.');
     }
   };
 
-  // Share user profile
-  const handleShareProfile = async () => {
-    if (!userData) return;
+  // Upload profile image to Firebase Storage
+  const uploadProfileImage = async (imageUri) => {
+    if (!imageUri || !user) return;
     
     try {
-      // Generate a dynamic link or a deep link to the user's profile
-      const profileUrl = `healthconnect://user/${userId}`;
-      const userName = `${userData.firstName || ''} ${userData.lastName || ''}`.trim();
+      setProfileImageUploading(true);
+      Haptics.impactMedium();
+      
+      // Generate a unique filename
+      const filename = `profile_${user.uid}_${Date.now()}.jpg`;
+      const storageRef = storage().ref(`profile_images/${filename}`);
+      
+      // Upload image
+      await storageRef.putFile(imageUri);
+      
+      // Get download URL
+      const downloadUrl = await storageRef.getDownloadURL();
+      
+      // Delete old profile image if exists
+      if (userData?.profileImageURL) {
+        try {
+          // Extract old filename from URL
+          const oldRef = storage().refFromURL(userData.profileImageURL);
+          await oldRef.delete();
+        } catch (error) {
+          console.log('Warning: Could not delete old profile image', error);
+          // Continue even if deletion fails
+        }
+      }
+      
+      // Update user data with new URL
+      await updateUserData({
+        profileImageURL: downloadUrl
+      });
+      
+      // Log analytics event
+      AnalyticsService.logEvent('profile_image_updated');
+      
+    } catch (error) {
+      console.error('Error uploading profile image:', error);
+      Alert.alert('Error', 'Failed to upload profile image. Please try again.');
+    } finally {
+      setProfileImageUploading(false);
+    }
+  };
+
+  // Confirm and remove profile image
+  const confirmRemoveProfileImage = () => {
+    Alert.alert(
+      'Remove Profile Picture',
+      'Are you sure you want to remove your profile picture?',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Remove', style: 'destructive', onPress: removeProfileImage }
+      ]
+    );
+  };
+
+  // Remove profile image
+  const removeProfileImage = async () => {
+    if (!userData?.profileImageURL) return;
+    
+    try {
+      setProfileImageUploading(true);
+      
+      // Delete profile image from storage
+      try {
+        const oldRef = storage().refFromURL(userData.profileImageURL);
+        await oldRef.delete();
+      } catch (error) {
+        console.log('Warning: Could not delete profile image from storage', error);
+        // Continue even if deletion fails
+      }
+      
+      // Update user data to remove URL
+      await updateUserData({
+        profileImageURL: null
+      });
+      
+      // Log analytics event
+      AnalyticsService.logEvent('profile_image_removed');
+      
+    } catch (error) {
+      console.error('Error removing profile image:', error);
+      Alert.alert('Error', 'Failed to remove profile image. Please try again.');
+    } finally {
+      setProfileImageUploading(false);
+    }
+  };
+
+  // Navigate to edit profile screen
+  const goToEditProfile = () => {
+    navigation.navigate('EditProfile');
+  };
+
+  // Navigate to followers list
+  const navigateToFollowers = () => {
+    if (stats.followersCount > 0) {
+      navigation.navigate('UserFollowers', { 
+        userId: user.uid,
+        title: 'Your Followers'
+      });
+    }
+  };
+  
+  // Navigate to following list
+  const navigateToFollowing = () => {
+    if (stats.followingCount > 0) {
+      navigation.navigate('UserFollowing', { 
+        userId: user.uid,
+        title: 'Your Following'
+      });
+    }
+  };
+
+  // Share profile
+  const handleShareProfile = async () => {
+    if (!user) return;
+    
+    try {
+      Haptics.impactLight();
+      
+      // Generate deep link or URI to the profile
+      const profileUrl = `healthconnect://user/${user.uid}`;
+      const displayName = userData ? 
+        `${userData.firstName || ''} ${userData.lastName || ''}`.trim() : 
+        'me';
       
       await Share.share({
-        message: `Connect with ${userName} on HealthConnect: ${profileUrl}`,
+        message: `Connect with ${displayName} on HealthConnect: ${profileUrl}`,
         url: Platform.OS === 'ios' ? profileUrl : undefined,
         title: 'Connect on HealthConnect'
       });
+      
+      // Log analytics event
+      AnalyticsService.logEvent('profile_shared');
     } catch (error) {
       console.error('Error sharing profile:', error);
       Alert.alert('Error', 'Failed to share profile. Please try again.');
     }
   };
 
-  // Handle block/unblock
-  const handleBlockToggle = useCallback(() => {
-    if (!isConnected) {
-      Alert.alert('Offline', 'You cannot block/unblock users while offline.');
-      return;
+  // Handle tab change with haptic feedback
+  const handleTabChange = (tab) => {
+    if (tab !== activeTab) {
+      setActiveTab(tab);
+      Haptics.selectionLight();
     }
-    
-    if (userIsBlocked) {
-      // Confirm unblock
-      const userName = userData ? `${userData.firstName || ''} ${userData.lastName || ''}`.trim() : 'this user';
-      
-      Alert.alert(
-        'Unblock User',
-        `Are you sure you want to unblock ${userName}?`,
-        [
-          { text: 'Cancel', style: 'cancel' },
-          { 
-            text: 'Unblock', 
-            onPress: async () => {
-              try {
-                const success = await unblockUser(userId);
-                if (success) {
-                  setUserIsBlocked(false);
-                  Alert.alert('Success', `${userName} has been unblocked.`);
-                  // Refresh posts after unblocking
-                  fetchUserPosts();
-                } else {
-                  throw new Error('Failed to unblock user');
-                }
-              } catch (error) {
-                console.error('Error unblocking user:', error);
-                Alert.alert('Error', 'Failed to unblock user. Please try again.');
-              }
+  };
+
+  // Handle logout
+  const handleLogout = () => {
+    Alert.alert(
+      'Logout',
+      'Are you sure you want to log out?',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Logout',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              await signOut();
+              // Navigation happens automatically in App.js when auth state changes
+              
+              // Log analytics event
+              AnalyticsService.logEvent('user_logout');
+            } catch (error) {
+              console.error('Error signing out:', error);
+              Alert.alert('Error', 'Failed to sign out. Please try again.');
             }
           }
-        ]
-      );
-    } else {
-      // Show block modal
-      setBlockModalVisible(true);
-    }
-  }, [userIsBlocked, userData, userId, unblockUser, isConnected]);
-
-  // Submit block with reason
-  const handleSubmitBlock = async () => {
-    try {
-      const success = await blockUser(userId, blockReason);
-      
-      if (success) {
-        setUserIsBlocked(true);
-        setBlockModalVisible(false);
-        
-        const userName = userData ? `${userData.firstName || ''} ${userData.lastName || ''}`.trim() : 'User';
-        
-        Alert.alert(
-          'User Blocked',
-          `You have blocked ${userName}. They will no longer be able to interact with you.`
-        );
-        
-        // If the user was following, unfollow automatically
-        if (isFollowing) {
-          firestore()
-            .collection('connections')
-            .where('userId', '==', user.uid)
-            .where('connectedUserId', '==', userId)
-            .get()
-            .then(snapshot => {
-              snapshot.forEach(doc => {
-                doc.ref.delete();
-              });
-              setIsFollowing(false);
-            });
         }
-        
-        // Clear posts when blocked
-        setPosts([]);
-      } else {
-        throw new Error('Failed to block user');
-      }
-    } catch (error) {
-      console.error('Error blocking user:', error);
-      Alert.alert('Error', 'Failed to block user. Please try again.');
-    }
+      ]
+    );
   };
 
-  // Handle report user
-  const handleReportUser = useCallback(() => {
-    if (!isConnected) {
-      Alert.alert('Offline', 'You cannot report users while offline.');
-      return;
-    }
-    
-    setReportModalVisible(true);
-  }, [isConnected]);
+  // Navigate to specific settings screen
+  const navigateToSettings = (screenName) => {
+    navigation.navigate(screenName);
+  };
 
-  // Submit report with reason
-  const submitReport = async (reason) => {
-    try {
-      // Add report to database
-      await firestore().collection('reports').add({
-        type: 'user',
-        contentId: userId,
-        reportedUserId: userId,
-        reportedBy: auth().currentUser.uid,
-        reason: reason,
-        timestamp: firestore.FieldValue.serverTimestamp(),
-        status: 'pending',
-        reviewed: false
-      });
-      
-      setReportModalVisible(false);
-      Alert.alert(
-        'Report Submitted',
-        'Thank you for your report. We will review this user.'
-      );
-    } catch (error) {
-      console.error('Error submitting report:', error);
-      Alert.alert('Error', 'Failed to submit report. Please try again.');
-    }
-  };
-  
-  // Format join date
-  const formatJoinDate = () => {
-    try {
-      if (!userData?.joinDate) return 'Recently';
-      
-      return format(userData.joinDate, 'MMMM yyyy');
-    } catch (error) {
-      console.error('Error formatting join date:', error);
-      return 'Recently';
-    }
-  };
-  
-  // Render post item
-  const renderPostItem = useCallback(({ item }) => (
+  // Render post item for grid view
+  const renderPostItem = useCallback(({ item, index }) => (
     <PostThumbnail 
       post={item} 
       onPress={() => navigation.navigate('PostDetail', { 
         postId: item.id,
-        title: 'Post Details'
+        title: 'Post'
       })}
+      testID={`post-thumbnail-${index}`}
+      accessibilityLabel={`Your post from ${format(item.timestamp, 'MMMM d, yyyy')}`}
     />
   ), [navigation]);
-  
-  // Render loading indicator
-  if (loading) {
+
+  // Display name formatting
+  const displayName = userData 
+    ? `${userData.firstName || ''} ${userData.lastName || ''}`.trim() 
+    : 'User';
+
+  // Loading state
+  if (loading && !userData) {
     return (
-      <View style={[styles.loadingContainer, { backgroundColor: theme.colors.background.default }]}>
+      <View 
+        style={[styles.loadingContainer, { backgroundColor: theme.colors.background.default }]}
+        accessibilityLabel="Loading profile"
+      >
         <ActivityIndicator size="large" color={theme.colors.primary.main} />
         <Text style={[styles.loadingText, { color: theme.colors.text.secondary }]}>
           Loading profile...
@@ -491,85 +466,106 @@ const UserProfileScreen = ({ route, navigation }) => {
       </View>
     );
   }
-  
-  // Render error state
-  if (error) {
-    return (
-      <View style={[styles.errorContainer, { backgroundColor: theme.colors.background.default }]}>
-        <Icon name="alert-circle-outline" size={64} color={theme.colors.error.main} />
-        <Text style={[styles.errorTitle, { color: theme.colors.text.primary }]}>
-          Error
-        </Text>
-        <Text style={[styles.errorMessage, { color: theme.colors.text.secondary }]}>
-          {error}
-        </Text>
-        <TouchableOpacity 
-          style={[styles.retryButton, { backgroundColor: theme.colors.primary.main }]}
-          onPress={fetchUserData}
-        >
-          <Text style={styles.retryButtonText}>Retry</Text>
-        </TouchableOpacity>
-      </View>
-    );
-  }
-  
-  // Get display name
-  const displayName = userData 
-    ? `${userData.firstName || ''} ${userData.lastName || ''}`.trim() 
-    : 'User';
-  
+
   return (
-    <View style={[styles.container, { backgroundColor: theme.colors.background.default }]}>
-      <ScrollView>
-        {/* User info header */}
+    <View 
+      style={[
+        styles.container, 
+        { 
+          backgroundColor: theme.colors.background.default,
+          paddingTop: insets.top
+        }
+      ]}
+      accessibilityLabel="Your profile"
+    >
+      <ScrollView
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={handleRefresh}
+            colors={[theme.colors.primary.main]}
+            tintColor={theme.colors.primary.main}
+          />
+        }
+        showsVerticalScrollIndicator={false}
+      >
+        {/* Header */}
         <View style={[styles.header, { backgroundColor: theme.colors.background.paper }]}>
-          <View style={styles.profileImageContainer}>
-            {userData?.profileImageURL ? (
-              <FastImage
-                style={styles.profileImage}
-                source={{ uri: userData.profileImageURL }}
-                resizeMode={FastImage.resizeMode.cover}
-                defaultSource={require('../assets/default-avatar.png')}
-              />
-            ) : (
+          {/* Profile Image Section */}
+          <View style={styles.profileImageSection}>
+            <TouchableOpacity 
+              style={styles.profileImageContainer}
+              onPress={handleChangeProfileImage}
+              disabled={profileImageUploading}
+              accessibilityLabel="Change profile picture"
+              accessibilityRole="button"
+              accessibilityHint="Double tap to change your profile picture"
+            >
+              {profileImageUploading ? (
+                <View style={[
+                  styles.profileImage, 
+                  styles.uploadingContainer,
+                  { backgroundColor: 'rgba(0, 0, 0, 0.3)' }
+                ]}>
+                  <ActivityIndicator size="large" color="white" />
+                </View>
+              ) : userData?.profileImageURL ? (
+                <FastImage
+                  style={styles.profileImage}
+                  source={{ uri: userData.profileImageURL }}
+                  resizeMode={FastImage.resizeMode.cover}
+                  defaultSource={require('../assets/default-avatar.png')}
+                />
+              ) : (
+                <View style={[
+                  styles.profileImage, 
+                  styles.defaultAvatar,
+                  { backgroundColor: theme.colors.gray[400] }
+                ]}>
+                  <Icon name="person" size={50} color="white" />
+                </View>
+              )}
+              
               <View style={[
-                styles.profileImage, 
-                styles.placeholderProfile,
-                { backgroundColor: theme.colors.gray[400] }
+                styles.editIconContainer,
+                { backgroundColor: theme.colors.primary.main }
               ]}>
-                <Icon name="person" size={40} color="#FFF" />
+                <Icon name="camera" size={16} color="white" />
               </View>
-            )}
+            </TouchableOpacity>
+            
+            <View style={styles.nameContainer}>
+              <Text style={[styles.displayName, { color: theme.colors.text.primary }]}>
+                {displayName}
+              </Text>
+              
+              {userData?.bio ? (
+                <Text 
+                  style={[styles.bio, { color: theme.colors.text.secondary }]}
+                  numberOfLines={3}
+                >
+                  {userData.bio}
+                </Text>
+              ) : (
+                <TouchableOpacity onPress={goToEditProfile}>
+                  <Text style={[styles.addBioText, { color: theme.colors.primary.main }]}>
+                    Add a bio
+                  </Text>
+                </TouchableOpacity>
+              )}
+            </View>
           </View>
           
-          <Text style={[styles.userName, { color: theme.colors.text.primary }]}>
-            {displayName}
-          </Text>
-          
-          {userData?.bio && !userIsBlocked && (
-            <Text style={[styles.bio, { color: theme.colors.text.secondary }]}>
-              {userData.bio}
-            </Text>
-          )}
-          
-          {userIsBlocked && (
-            <View style={[styles.blockedBanner, { backgroundColor: theme.colors.error.light }]}>
-              <Icon name="ban" size={20} color={theme.colors.error.main} />
-              <Text style={[styles.blockedText, { color: theme.colors.error.main }]}>
-                You have blocked this user
-              </Text>
-            </View>
-          )}
-          
-          {/* Stats section */}
+          {/* Stats Section */}
           <View style={[
             styles.statsContainer,
-            { 
-              borderColor: theme.colors.divider 
-            }
+            { borderColor: theme.colors.divider }
           ]}>
             <View style={styles.statItem}>
-              <Text style={[styles.statNumber, { color: theme.colors.text.primary }]}>
+              <Text 
+                style={[styles.statNumber, { color: theme.colors.text.primary }]}
+                accessibilityLabel={`${stats.postsCount} posts`}
+              >
                 {stats.postsCount}
               </Text>
               <Text style={[styles.statLabel, { color: theme.colors.text.secondary }]}>
@@ -579,119 +575,73 @@ const UserProfileScreen = ({ route, navigation }) => {
             
             <View style={[styles.statDivider, { backgroundColor: theme.colors.divider }]} />
             
-            <View style={styles.statItem}>
+            <TouchableOpacity 
+              style={styles.statItem}
+              onPress={navigateToFollowers}
+              disabled={stats.followersCount === 0}
+              accessibilityLabel={`${stats.followersCount} followers. ${stats.followersCount > 0 ? 'Double tap to view' : ''}`}
+              accessibilityRole={stats.followersCount > 0 ? "button" : "none"}
+              accessibilityHint={stats.followersCount > 0 ? "View list of followers" : ""}
+            >
               <Text style={[styles.statNumber, { color: theme.colors.text.primary }]}>
                 {stats.followersCount}
               </Text>
               <Text style={[styles.statLabel, { color: theme.colors.text.secondary }]}>
                 Followers
               </Text>
-            </View>
+            </TouchableOpacity>
             
             <View style={[styles.statDivider, { backgroundColor: theme.colors.divider }]} />
             
-            <View style={styles.statItem}>
+            <TouchableOpacity 
+              style={styles.statItem}
+              onPress={navigateToFollowing}
+              disabled={stats.followingCount === 0}
+              accessibilityLabel={`${stats.followingCount} following. ${stats.followingCount > 0 ? 'Double tap to view' : ''}`}
+              accessibilityRole={stats.followingCount > 0 ? "button" : "none"}
+              accessibilityHint={stats.followingCount > 0 ? "View list of accounts followed" : ""}
+            >
               <Text style={[styles.statNumber, { color: theme.colors.text.primary }]}>
                 {stats.followingCount}
               </Text>
               <Text style={[styles.statLabel, { color: theme.colors.text.secondary }]}>
                 Following
               </Text>
-            </View>
+            </TouchableOpacity>
           </View>
           
-          {/* Actions */}
-          <View style={styles.actionsContainer}>
+          {/* Action Buttons */}
+          <View style={styles.actionButtonsContainer}>
             <TouchableOpacity 
               style={[
-                styles.actionButton,
-                styles.followButton,
-                isFollowing && [
-                  styles.followingButton,
-                  { borderColor: theme.colors.primary.main }
-                ],
-                { 
-                  backgroundColor: isFollowing 
-                    ? theme.colors.background.paper 
-                    : theme.colors.primary.main
-                }
+                styles.editProfileButton,
+                { backgroundColor: theme.colors.primary.main }
               ]}
-              onPress={toggleFollow}
-              disabled={followLoading || userIsBlocked}
+              onPress={goToEditProfile}
+              accessibilityLabel="Edit profile"
+              accessibilityRole="button"
             >
-              {followLoading ? (
-                <ActivityIndicator 
-                  size="small" 
-                  color={isFollowing ? theme.colors.primary.main : 'white'} 
-                />
-              ) : (
-                <Text 
-                  style={[
-                    styles.actionButtonText,
-                    styles.followButtonText,
-                    { color: isFollowing ? theme.colors.primary.main : 'white' }
-                  ]}
-                >
-                  {isFollowing ? 'Following' : 'Follow'}
-                </Text>
-              )}
+              <Text style={styles.editProfileText}>Edit Profile</Text>
             </TouchableOpacity>
             
             <TouchableOpacity 
               style={[
-                styles.actionButton,
+                styles.shareButton,
                 { backgroundColor: theme.colors.background.paper }
               ]}
               onPress={handleShareProfile}
+              accessibilityLabel="Share profile"
+              accessibilityRole="button"
             >
-              <Text style={[
-                styles.actionButtonText,
-                { color: theme.colors.text.primary }
-              ]}>
-                Share
-              </Text>
-            </TouchableOpacity>
-            
-            {/* More Options Button */}
-            <TouchableOpacity 
-              style={[
-                styles.actionButton,
-                { backgroundColor: theme.colors.background.paper }
-              ]}
-              onPress={() => {
-                Alert.alert(
-                  'More Options',
-                  null,
-                  [
-                    { 
-                      text: userIsBlocked ? 'Unblock User' : 'Block User', 
-                      onPress: handleBlockToggle,
-                      style: userIsBlocked ? 'default' : 'destructive'
-                    },
-                    { 
-                      text: 'Report User', 
-                      onPress: handleReportUser,
-                      style: 'destructive'
-                    },
-                    { text: 'Cancel', style: 'cancel' }
-                  ]
-                );
-              }}
-            >
-              <Text style={[
-                styles.actionButtonText,
-                { color: theme.colors.text.primary }
-              ]}>
-                More
-              </Text>
+              <Icon name="share-social-outline" size={24} color={theme.colors.primary.main} />
             </TouchableOpacity>
           </View>
           
-          {/* Medical conditions */}
-          {userData?.medicalConditions && userData.medicalConditions.length > 0 && !userIsBlocked && (
+          {/* Medical Conditions */}
+          {userData?.medicalConditions && userData.medicalConditions.length > 0 && (
             <View style={styles.conditionsContainer}>
               <Text style={[
-                styles.conditionsTitle,
+                styles.sectionTitle,
                 { color: theme.colors.text.primary }
               ]}>
                 Medical Conditions
@@ -738,7 +688,10 @@ const UserProfileScreen = ({ route, navigation }) => {
                 { borderBottomColor: theme.colors.primary.main }
               ]
             ]}
-            onPress={() => setActiveTab('posts')}
+            onPress={() => handleTabChange('posts')}
+            accessibilityLabel="Posts tab"
+            accessibilityRole="tab"
+            accessibilityState={{ selected: activeTab === 'posts' }}
           >
             <Icon 
               name="grid-outline" 
@@ -765,17 +718,20 @@ const UserProfileScreen = ({ route, navigation }) => {
           <TouchableOpacity 
             style={[
               styles.tab,
-              activeTab === 'about' && [
+              activeTab === 'settings' && [
                 styles.activeTab,
                 { borderBottomColor: theme.colors.primary.main }
               ]
             ]}
-            onPress={() => setActiveTab('about')}
+            onPress={() => handleTabChange('settings')}
+            accessibilityLabel="Settings tab"
+            accessibilityRole="tab"
+            accessibilityState={{ selected: activeTab === 'settings' }}
           >
             <Icon 
-              name="information-circle-outline" 
+              name="settings-outline" 
               size={22} 
-              color={activeTab === 'about' 
+              color={activeTab === 'settings' 
                 ? theme.colors.primary.main
                 : theme.colors.text.secondary
               } 
@@ -783,14 +739,14 @@ const UserProfileScreen = ({ route, navigation }) => {
             <Text 
               style={[
                 styles.tabText, 
-                activeTab === 'about' && [
+                activeTab === 'settings' && [
                   styles.activeTabText,
                   { color: theme.colors.primary.main }
                 ],
                 { color: theme.colors.text.secondary }
               ]}
             >
-              About
+              Settings
             </Text>
           </TouchableOpacity>
         </View>
@@ -798,185 +754,248 @@ const UserProfileScreen = ({ route, navigation }) => {
         {/* Content based on active tab */}
         {activeTab === 'posts' ? (
           <View style={styles.postsContainer}>
-            {userIsBlocked ? (
+            {postsLoading ? (
+              <View style={styles.loadingPostsContainer}>
+                <ActivityIndicator size="large" color={theme.colors.primary.main} />
+              </View>
+            ) : posts.length === 0 ? (
               <View style={styles.emptyContainer}>
-                <Icon name="eye-off-outline" size={50} color={theme.colors.gray[300]} />
+                <Icon name="images-outline" size={50} color={theme.colors.gray[300]} />
                 <Text style={[styles.emptyTitle, { color: theme.colors.text.primary }]}>
-                  Posts Hidden
+                  No Posts Yet
                 </Text>
                 <Text style={[styles.emptySubtitle, { color: theme.colors.text.secondary }]}>
-                  You've blocked this user, so their posts are hidden
+                  Share your first post with the community
                 </Text>
                 <TouchableOpacity 
                   style={[
-                    styles.unblockButton,
+                    styles.createPostButton,
                     { backgroundColor: theme.colors.primary.main }
                   ]}
-                  onPress={handleBlockToggle}
+                  onPress={() => navigation.navigate('NewPost')}
                 >
-                  <Text style={styles.unblockButtonText}>Unblock User</Text>
+                  <Text style={styles.createPostText}>Create Post</Text>
                 </TouchableOpacity>
-            </View>
-            
-            <View style={styles.modalActions}>
-              <TouchableOpacity 
-                style={[
-                  styles.cancelButton,
-                  { borderColor: theme.colors.divider }
-                ]}
-                onPress={() => setBlockModalVisible(false)}
-              >
-                <Text style={[
-                  styles.cancelButtonText,
-                  { color: theme.colors.text.primary }
-                ]}>
-                  Cancel
-                </Text>
-              </TouchableOpacity>
-              
-              <TouchableOpacity 
-                style={[
-                  styles.blockButton,
-                  { backgroundColor: theme.colors.error.main }
-                ]}
-                onPress={handleSubmitBlock}
-              >
-                <Text style={styles.blockButtonText}>
-                  Block User
-                </Text>
-              </TouchableOpacity>
-            </View>
+              </View>
+            ) : (
+              <FlatList
+                data={posts}
+                keyExtractor={item => item.id}
+                renderItem={renderPostItem}
+                numColumns={3}
+                scrollEnabled={false}
+                contentContainerStyle={styles.postsGrid}
+              />
+            )}
           </View>
-        </View>
-      </Modal>
-      
-      {/* Report User Modal */}
-      <Modal
-        visible={reportModalVisible}
-        transparent
-        animationType="fade"
-        onRequestClose={() => setReportModalVisible(false)}
-      >
-        <View style={styles.modalOverlay}>
-          <View style={[
-            styles.modalContainer,
-            { backgroundColor: theme.colors.background.paper }
-          ]}>
-            <View style={styles.modalHeader}>
-              <Text style={[
-                styles.modalTitle,
-                { color: theme.colors.text.primary }
-              ]}>
-                Report {displayName}
-              </Text>
-              <TouchableOpacity onPress={() => setReportModalVisible(false)}>
-                <Icon name="close" size={24} color={theme.colors.text.secondary} />
-              </TouchableOpacity>
-            </View>
+        ) : (
+          <View style={styles.settingsContainer}>
+            {/* Settings Groups */}
             
-            <Text style={[
-              styles.modalDescription,
-              { color: theme.colors.text.secondary }
+            {/* Account Settings */}
+            <View style={[
+              styles.settingsGroup,
+              { backgroundColor: theme.colors.background.paper }
             ]}>
-              Please select a reason for reporting this user. Our team will review the report.
-            </Text>
+              <Text style={[
+                styles.settingsGroupTitle,
+                { color: theme.colors.text.primary }
+              ]}>
+                Account
+              </Text>
+              
+              <TouchableOpacity 
+                style={[
+                  styles.settingsItem,
+                  { borderBottomColor: theme.colors.divider }
+                ]}
+                onPress={goToEditProfile}
+              >
+                <Icon name="person-outline" size={22} color={theme.colors.text.secondary} />
+                <Text style={[styles.settingsItemText, { color: theme.colors.text.primary }]}>
+                  Edit Profile
+                </Text>
+                <Icon name="chevron-forward" size={18} color={theme.colors.text.hint} />
+              </TouchableOpacity>
+              
+              <TouchableOpacity 
+                style={[
+                  styles.settingsItem,
+                  { borderBottomColor: theme.colors.divider }
+                ]}
+                onPress={() => navigateToSettings('BlockedUsers')}
+              >
+                <Icon name="ban-outline" size={22} color={theme.colors.text.secondary} />
+                <Text style={[styles.settingsItemText, { color: theme.colors.text.primary }]}>
+                  Blocked Users
+                </Text>
+                <Icon name="chevron-forward" size={18} color={theme.colors.text.hint} />
+              </TouchableOpacity>
+              
+              <TouchableOpacity 
+                style={styles.settingsItem}
+                onPress={() => navigateToSettings('PrivacySettings')}
+              >
+                <Icon name="lock-closed-outline" size={22} color={theme.colors.text.secondary} />
+                <Text style={[styles.settingsItemText, { color: theme.colors.text.primary }]}>
+                  Privacy
+                </Text>
+                <Icon name="chevron-forward" size={18} color={theme.colors.text.hint} />
+              </TouchableOpacity>
+            </View>
             
-            <View style={styles.reportOptions}>
-              <TouchableOpacity 
+            {/* Appearance Settings */}
+            <View style={[
+              styles.settingsGroup,
+              { backgroundColor: theme.colors.background.paper }
+            ]}>
+              <Text style={[
+                styles.settingsGroupTitle,
+                { color: theme.colors.text.primary }
+              ]}>
+                Appearance
+              </Text>
+              
+              <View 
                 style={[
-                  styles.reportOption,
+                  styles.settingsItem,
                   { borderBottomColor: theme.colors.divider }
                 ]}
-                onPress={() => submitReport('Harassment or Bullying')}
               >
-                <Icon name="alert-circle-outline" size={20} color={theme.colors.error.main} />
-                <Text style={[
-                  styles.reportOptionText,
-                  { color: theme.colors.text.primary }
-                ]}>
-                  Harassment or Bullying
+                <Icon name="moon-outline" size={22} color={theme.colors.text.secondary} />
+                <Text style={[styles.settingsItemText, { color: theme.colors.text.primary }]}>
+                  Dark Mode
                 </Text>
+                <Switch
+                  value={isDarkMode}
+                  onValueChange={toggleTheme}
+                  trackColor={{
+                    false: theme.colors.divider,
+                    true: theme.colors.primary.light
+                  }}
+                  thumbColor={isDarkMode ? theme.colors.primary.main : '#f4f3f4'}
+                />
+              </View>
+              
+              <TouchableOpacity 
+                style={styles.settingsItem}
+                onPress={() => navigateToSettings('AccessibilitySettings')}
+              >
+                <Icon name="accessibility-outline" size={22} color={theme.colors.text.secondary} />
+                <Text style={[styles.settingsItemText, { color: theme.colors.text.primary }]}>
+                  Accessibility
+                </Text>
+                <Icon name="chevron-forward" size={18} color={theme.colors.text.hint} />
+              </TouchableOpacity>
+            </View>
+            
+            {/* Notifications */}
+            <View style={[
+              styles.settingsGroup,
+              { backgroundColor: theme.colors.background.paper }
+            ]}>
+              <Text style={[
+                styles.settingsGroupTitle,
+                { color: theme.colors.text.primary }
+              ]}>
+                Notifications
+              </Text>
+              
+              <View 
+                style={styles.settingsItem}
+              >
+                <Icon name="notifications-outline" size={22} color={theme.colors.text.secondary} />
+                <Text style={[styles.settingsItemText, { color: theme.colors.text.primary }]}>
+                  Push Notifications
+                </Text>
+                <Switch
+                  value={notificationsEnabled}
+                  onValueChange={toggleNotifications}
+                  trackColor={{
+                    false: theme.colors.divider,
+                    true: theme.colors.primary.light
+                  }}
+                  thumbColor={notificationsEnabled ? theme.colors.primary.main : '#f4f3f4'}
+                />
+              </View>
+            </View>
+            
+            {/* More Settings */}
+            <View style={[
+              styles.settingsGroup,
+              { backgroundColor: theme.colors.background.paper }
+            ]}>
+              <Text style={[
+                styles.settingsGroupTitle,
+                { color: theme.colors.text.primary }
+              ]}>
+                More
+              </Text>
+              
+              <TouchableOpacity 
+                style={[
+                  styles.settingsItem,
+                  { borderBottomColor: theme.colors.divider }
+                ]}
+                onPress={() => navigateToSettings('About')}
+              >
+                <Icon name="information-circle-outline" size={22} color={theme.colors.text.secondary} />
+                <Text style={[styles.settingsItemText, { color: theme.colors.text.primary }]}>
+                  About HealthConnect
+                </Text>
+                <Icon name="chevron-forward" size={18} color={theme.colors.text.hint} />
               </TouchableOpacity>
               
               <TouchableOpacity 
                 style={[
-                  styles.reportOption,
+                  styles.settingsItem,
                   { borderBottomColor: theme.colors.divider }
                 ]}
-                onPress={() => submitReport('Inappropriate Content')}
+                onPress={() => navigateToSettings('LanguageSettings')}
               >
-                <Icon name="eye-off-outline" size={20} color={theme.colors.error.main} />
-                <Text style={[
-                  styles.reportOptionText,
-                  { color: theme.colors.text.primary }
-                ]}>
-                  Inappropriate Content
+                <Icon name="language-outline" size={22} color={theme.colors.text.secondary} />
+                <Text style={[styles.settingsItemText, { color: theme.colors.text.primary }]}>
+                  Language
                 </Text>
+                <Icon name="chevron-forward" size={18} color={theme.colors.text.hint} />
               </TouchableOpacity>
               
               <TouchableOpacity 
-                style={[
-                  styles.reportOption,
-                  { borderBottomColor: theme.colors.divider }
-                ]}
-                onPress={() => submitReport('Spam or Scam')}
+                style={styles.settingsItem}
+                onPress={handleLogout}
               >
-                <Icon name="mail-unread-outline" size={20} color={theme.colors.error.main} />
-                <Text style={[
-                  styles.reportOptionText,
-                  { color: theme.colors.text.primary }
-                ]}>
-                  Spam or Scam
-                </Text>
-              </TouchableOpacity>
-              
-              <TouchableOpacity 
-                style={[
-                  styles.reportOption,
-                  { borderBottomColor: theme.colors.divider }
-                ]}
-                onPress={() => submitReport('False Medical Information')}
-              >
-                <Icon name="medical-outline" size={20} color={theme.colors.error.main} />
-                <Text style={[
-                  styles.reportOptionText,
-                  { color: theme.colors.text.primary }
-                ]}>
-                  False Medical Information
-                </Text>
-              </TouchableOpacity>
-              
-              <TouchableOpacity 
-                style={styles.reportOption}
-                onPress={() => submitReport('Other')}
-              >
-                <Icon name="ellipsis-horizontal" size={20} color={theme.colors.error.main} />
-                <Text style={[
-                  styles.reportOptionText,
-                  { color: theme.colors.text.primary }
-                ]}>
-                  Other
+                <Icon name="log-out-outline" size={22} color={theme.colors.error.main} />
+                <Text style={[styles.settingsItemText, { color: theme.colors.error.main }]}>
+                  Log Out
                 </Text>
               </TouchableOpacity>
             </View>
             
-            <TouchableOpacity 
-              style={[
-                styles.cancelButton,
-                { borderColor: theme.colors.divider, marginTop: 12 }
-              ]}
-              onPress={() => setReportModalVisible(false)}
-            >
-              <Text style={[
-                styles.cancelButtonText,
-                { color: theme.colors.text.primary }
-              ]}>
-                Cancel
-              </Text>
-            </TouchableOpacity>
+            {/* Version Info */}
+            <Text style={[
+              styles.versionText,
+              { color: theme.colors.text.hint }
+            ]}>
+              Version 0.1.0
+            </Text>
           </View>
-        </View>
-      </Modal>
+        )}
+      </ScrollView>
+      
+      {/* Floating Action Button for creating post */}
+      {activeTab === 'posts' && (
+        <TouchableOpacity
+          style={[
+            styles.fab,
+            { backgroundColor: theme.colors.primary.main }
+          ]}
+          onPress={() => navigation.navigate('NewPost')}
+          accessibilityLabel="Create new post"
+          accessibilityRole="button"
+        >
+          <Icon name="add" size={24} color="white" />
+        </TouchableOpacity>
+      )}
     </View>
   );
 };
@@ -994,81 +1013,66 @@ const styles = StyleSheet.create({
     marginTop: 10,
     fontSize: 16,
   },
-  errorContainer: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    padding: 20,
-  },
-  errorTitle: {
-    fontSize: 20,
-    fontWeight: 'bold',
-    marginTop: 16,
-    marginBottom: 8,
-  },
-  errorMessage: {
-    fontSize: 16,
-    textAlign: 'center',
-    marginBottom: 20,
-  },
-  retryButton: {
-    paddingVertical: 12,
-    paddingHorizontal: 16,
-    borderRadius: 8,
-  },
-  retryButtonText: {
-    color: 'white',
-    fontWeight: 'bold',
-  },
   header: {
-    padding: 20,
-    alignItems: 'center',
+    padding: 16,
     borderBottomWidth: 1,
-    borderBottomColor: '#ECEFF1',
+    borderBottomColor: 'rgba(0, 0, 0, 0.1)',
   },
-  profileImageContainer: {
-    marginBottom: 15,
-  },
-  profileImage: {
-    width: 120,
-    height: 120,
-    borderRadius: 60,
-  },
-  placeholderProfile: {
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  userName: {
-    fontSize: 24,
-    fontWeight: 'bold',
-    marginBottom: 5,
-  },
-  bio: {
-    fontSize: 16,
-    textAlign: 'center',
-    marginBottom: 15,
-    paddingHorizontal: 20,
-  },
-  blockedBanner: {
+  profileImageSection: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingVertical: 8,
-    paddingHorizontal: 16,
-    borderRadius: 8,
-    marginBottom: 15,
+    marginBottom: 16,
   },
-  blockedText: {
-    marginLeft: 8,
-    fontWeight: '500',
+  profileImageContainer: {
+    position: 'relative',
+    marginRight: 16,
+  },
+  profileImage: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+  },
+  defaultAvatar: {
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  uploadingContainer: {
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  editIconContainer: {
+    position: 'absolute',
+    bottom: 0,
+    right: 0,
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 2,
+    borderColor: 'white',
+  },
+  nameContainer: {
+    flex: 1,
+  },
+  displayName: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    marginBottom: 4,
+  },
+  bio: {
+    fontSize: 14,
+    lineHeight: 18,
+  },
+  addBioText: {
+    fontSize: 14,
   },
   statsContainer: {
     flexDirection: 'row',
     justifyContent: 'space-around',
-    width: '100%',
-    paddingVertical: 15,
+    paddingVertical: 16,
     borderTopWidth: 1,
     borderBottomWidth: 1,
-    marginBottom: 15,
   },
   statItem: {
     alignItems: 'center',
@@ -1084,51 +1088,46 @@ const styles = StyleSheet.create({
     width: 1,
     height: '80%',
   },
-  actionsContainer: {
+  actionButtonsContainer: {
     flexDirection: 'row',
-    width: '100%',
-    justifyContent: 'space-between',
-    marginBottom: 15,
+    marginVertical: 16,
   },
-  actionButton: {
+  editProfileButton: {
     flex: 1,
-    paddingVertical: 8,
-    paddingHorizontal: 12,
+    height: 40,
     borderRadius: 8,
     alignItems: 'center',
     justifyContent: 'center',
-    marginHorizontal: 4,
-    borderWidth: 1,
-    borderColor: 'transparent',
+    marginRight: 8,
   },
-  actionButtonText: {
+  editProfileText: {
+    color: 'white',
     fontWeight: 'bold',
   },
-  followButton: {
-    flex: 1.2,
-  },
-  followButtonText: {
-    color: 'white',
-  },
-  followingButton: {
-    backgroundColor: 'transparent',
+  shareButton: {
+    width: 40,
+    height: 40,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(0, 0, 0, 0.1)',
   },
   conditionsContainer: {
-    width: '100%',
-    marginTop: 5,
+    marginTop: 8,
   },
-  conditionsTitle: {
+  sectionTitle: {
     fontSize: 16,
     fontWeight: 'bold',
-    marginBottom: 10,
+    marginBottom: 8,
   },
   conditionsList: {
-    paddingBottom: 10,
+    paddingBottom: 8,
   },
   conditionTag: {
-    borderRadius: 20,
-    paddingVertical: 6,
     paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 16,
     marginRight: 8,
   },
   conditionText: {
@@ -1141,27 +1140,29 @@ const styles = StyleSheet.create({
   tab: {
     flex: 1,
     flexDirection: 'row',
-    justifyContent: 'center',
     alignItems: 'center',
+    justifyContent: 'center',
     paddingVertical: 12,
   },
   activeTab: {
     borderBottomWidth: 2,
   },
   tabText: {
-    marginLeft: 5,
-    fontSize: 16,
+    marginLeft: 8,
+    fontSize: 15,
   },
   activeTabText: {
     fontWeight: 'bold',
   },
   postsContainer: {
     flex: 1,
-    minHeight: 300,
   },
-  loadingPosts: {
-    padding: 40,
+  loadingPostsContainer: {
+    paddingVertical: 30,
     alignItems: 'center',
+  },
+  postsGrid: {
+    padding: 1,
   },
   emptyContainer: {
     alignItems: 'center',
@@ -1172,323 +1173,71 @@ const styles = StyleSheet.create({
     fontSize: 18,
     fontWeight: 'bold',
     marginTop: 10,
-    marginBottom: 5,
+    marginBottom: 6,
   },
   emptySubtitle: {
     fontSize: 14,
     textAlign: 'center',
     marginBottom: 20,
   },
-  unblockButton: {
-    paddingVertical: 10,
+  createPostButton: {
+    paddingVertical: 12,
     paddingHorizontal: 16,
     borderRadius: 8,
   },
-  unblockButtonText: {
+  createPostText: {
     color: 'white',
     fontWeight: 'bold',
   },
-  aboutContainer: {
-    padding: 20,
+  settingsContainer: {
+    flex: 1,
+    paddingBottom: 20,
   },
-  infoRow: {
+  settingsGroup: {
+    marginTop: 16,
+    borderRadius: 10,
+    overflow: 'hidden',
+  },
+  settingsGroupTitle: {
+    fontSize: 14,
+    fontWeight: 'bold',
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    textTransform: 'uppercase',
+  },
+  settingsItem: {
     flexDirection: 'row',
     alignItems: 'center',
     paddingVertical: 12,
+    paddingHorizontal: 16,
     borderBottomWidth: 1,
   },
-  infoText: {
-    marginLeft: 10,
+  settingsItemText: {
+    flex: 1,
+    marginLeft: 16,
     fontSize: 16,
   },
-  modalOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+  versionText: {
+    fontSize: 12,
+    textAlign: 'center',
+    marginTop: 20,
+    marginBottom: 10,
+  },
+  fab: {
+    position: 'absolute',
+    right: 16,
+    bottom: 16,
+    width: 56,
+    height: 56,
+    borderRadius: 28,
     justifyContent: 'center',
     alignItems: 'center',
-    padding: 20,
-  },
-  modalContainer: {
-    borderRadius: 12,
-    width: '100%',
-    maxWidth: 400,
-    padding: 20,
+    elevation: 4,
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.25,
     shadowRadius: 3.84,
-    elevation: 5,
-  },
-  modalHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 16,
-  },
-  modalTitle: {
-    fontSize: 18,
-    fontWeight: 'bold',
-  },
-  modalDescription: {
-    marginBottom: 20,
-    fontSize: 14,
-    lineHeight: 20,
-  },
-  reasonLabel: {
-    fontSize: 16,
-    fontWeight: '500',
-    marginBottom: 12,
-  },
-  reasonOptions: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    marginBottom: 20,
-  },
-  reasonOption: {
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: 'rgba(0, 0, 0, 0.1)',
-    margin: 4,
-  },
-  selectedReasonOption: {
-    borderColor: 'transparent',
-  },
-  reasonText: {
-    fontSize: 14,
-  },
-  modalActions: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-  },
-  cancelButton: {
-    flex: 1,
-    paddingVertical: 12,
-    borderRadius: 8,
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderWidth: 1,
-    marginRight: 8,
-  },
-  cancelButtonText: {
-    fontSize: 16,
-    fontWeight: '500',
-  },
-  blockButton: {
-    flex: 1,
-    paddingVertical: 12,
-    borderRadius: 8,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginLeft: 8,
-  },
-  blockButtonText: {
-    color: 'white',
-    fontSize: 16,
-    fontWeight: 'bold',
-  },
-  reportOptions: {
-    marginBottom: 12,
-  },
-  reportOption: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: 14,
-    borderBottomWidth: 1,
-  },
-  reportOptionText: {
-    fontSize: 16,
-    marginLeft: 12,
   }
 });
 
-export default UserProfileScreen;
-              </View>
-            ) : postsLoading ? (
-              <View style={styles.loadingPosts}>
-                <ActivityIndicator size="large" color={theme.colors.primary.main} />
-              </View>
-            ) : posts.length === 0 ? (
-              <View style={styles.emptyContainer}>
-                <Icon name="images-outline" size={50} color={theme.colors.gray[300]} />
-                <Text style={[styles.emptyTitle, { color: theme.colors.text.primary }]}>
-                  No Posts Yet
-                </Text>
-                <Text style={[styles.emptySubtitle, { color: theme.colors.text.secondary }]}>
-                  This user hasn't shared any posts
-                </Text>
-              </View>
-            ) : (
-              <FlatList
-                data={posts}
-                keyExtractor={item => item.id}
-                numColumns={3}
-                scrollEnabled={false}
-                renderItem={renderPostItem}
-              />
-            )}
-          </View>
-        ) : (
-          <View style={[
-            styles.aboutContainer,
-            { backgroundColor: theme.colors.background.paper }
-          ]}>
-            {!userIsBlocked ? (
-              <>
-                <View style={[styles.infoRow, { borderBottomColor: theme.colors.divider }]}>
-                  <Icon name="mail-outline" size={20} color={theme.colors.text.secondary} />
-                  <Text style={[styles.infoText, { color: theme.colors.text.primary }]}>
-                    {userData?.email || 'No email provided'}
-                  </Text>
-                </View>
-                
-                <View style={[styles.infoRow, { borderBottomColor: theme.colors.divider }]}>
-                  <Icon name="transgender-outline" size={20} color={theme.colors.text.secondary} />
-                  <Text style={[styles.infoText, { color: theme.colors.text.primary }]}>
-                    {userData?.gender || 'Not specified'}
-                  </Text>
-                </View>
-                
-                <View style={[styles.infoRow, { borderBottomColor: theme.colors.divider }]}>
-                  <Icon name="calendar-outline" size={20} color={theme.colors.text.secondary} />
-                  <Text style={[styles.infoText, { color: theme.colors.text.primary }]}>
-                    Joined {formatJoinDate()}
-                  </Text>
-                </View>
-              </>
-            ) : (
-              <View style={styles.emptyContainer}>
-                <Icon name="eye-off-outline" size={50} color={theme.colors.gray[300]} />
-                <Text style={[styles.emptyTitle, { color: theme.colors.text.primary }]}>
-                  Information Hidden
-                </Text>
-                <Text style={[styles.emptySubtitle, { color: theme.colors.text.secondary }]}>
-                  You've blocked this user, so their information is hidden
-                </Text>
-                <TouchableOpacity 
-                  style={[
-                    styles.unblockButton,
-                    { backgroundColor: theme.colors.primary.main }
-                  ]}
-                  onPress={handleBlockToggle}
-                >
-                  <Text style={styles.unblockButtonText}>Unblock User</Text>
-                </TouchableOpacity>
-              </View>
-            )}
-          </View>
-        )}
-      </ScrollView>
-      
-      {/* Block User Modal */}
-      <Modal
-        visible={blockModalVisible}
-        transparent
-        animationType="fade"
-        onRequestClose={() => setBlockModalVisible(false)}
-      >
-        <View style={styles.modalOverlay}>
-          <View style={[
-            styles.modalContainer,
-            { backgroundColor: theme.colors.background.paper }
-          ]}>
-            <View style={styles.modalHeader}>
-              <Text style={[
-                styles.modalTitle,
-                { color: theme.colors.text.primary }
-              ]}>
-                Block {displayName}
-              </Text>
-              <TouchableOpacity onPress={() => setBlockModalVisible(false)}>
-                <Icon name="close" size={24} color={theme.colors.text.secondary} />
-              </TouchableOpacity>
-            </View>
-            
-            <Text style={[
-              styles.modalDescription,
-              { color: theme.colors.text.secondary }
-            ]}>
-              When you block someone, they won't be able to follow you or view your posts.
-              They also won't be notified that you blocked them.
-            </Text>
-            
-            <Text style={[
-              styles.reasonLabel,
-              { color: theme.colors.text.primary }
-            ]}>
-              Reason for blocking (optional):
-            </Text>
-            
-            <View style={styles.reasonOptions}>
-              <TouchableOpacity 
-                style={[
-                  styles.reasonOption,
-                  blockReason === 'Harassment' && [
-                    styles.selectedReasonOption,
-                    { backgroundColor: theme.colors.primary.lightest }
-                  ]
-                ]}
-                onPress={() => setBlockReason('Harassment')}
-              >
-                <Text style={[
-                  styles.reasonText,
-                  blockReason === 'Harassment' && { color: theme.colors.primary.main }
-                ]}>
-                  Harassment
-                </Text>
-              </TouchableOpacity>
-              
-              <TouchableOpacity 
-                style={[
-                  styles.reasonOption,
-                  blockReason === 'Inappropriate Content' && [
-                    styles.selectedReasonOption,
-                    { backgroundColor: theme.colors.primary.lightest }
-                  ]
-                ]}
-                onPress={() => setBlockReason('Inappropriate Content')}
-              >
-                <Text style={[
-                  styles.reasonText,
-                  blockReason === 'Inappropriate Content' && { color: theme.colors.primary.main }
-                ]}>
-                  Inappropriate Content
-                </Text>
-              </TouchableOpacity>
-              
-              <TouchableOpacity 
-                style={[
-                  styles.reasonOption,
-                  blockReason === 'Spam' && [
-                    styles.selectedReasonOption,
-                    { backgroundColor: theme.colors.primary.lightest }
-                  ]
-                ]}
-                onPress={() => setBlockReason('Spam')}
-              >
-                <Text style={[
-                  styles.reasonText,
-                  blockReason === 'Spam' && { color: theme.colors.primary.main }
-                ]}>
-                  Spam
-                </Text>
-              </TouchableOpacity>
-              
-              <TouchableOpacity 
-                style={[
-                  styles.reasonOption,
-                  blockReason === 'Other' && [
-                    styles.selectedReasonOption,
-                    { backgroundColor: theme.colors.primary.lightest }
-                  ]
-                ]}
-                onPress={() => setBlockReason('Other')}
-              >
-                <Text style={[
-                  styles.reasonText,
-                  blockReason === 'Other' && { color: theme.colors.primary.main }
-                ]}>
-                  Other
-                </Text>
-              </TouchableOpacity>
+export default ProfileScreen;
